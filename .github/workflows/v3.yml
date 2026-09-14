@@ -1,0 +1,753 @@
+name: QGSS 2026 T3 Benchmark V3
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/qgss-t3-benchmark.yml"
+  workflow_dispatch:
+
+jobs:
+  benchmark-v3:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install qiskit qiskit-aer qiskit-ibm-runtime numpy pandas
+
+      - name: Run T3 V3 benchmark
+        env:
+          IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
+          IBM_QUANTUM_INSTANCE: ${{ secrets.IBM_QUANTUM_INSTANCE }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import time
+          import math
+          import itertools
+          import numpy as np
+          import pandas as pd
+
+          from qiskit import QuantumCircuit, transpile
+          from qiskit_aer import AerSimulator
+          from qiskit_ibm_runtime import (
+              QiskitRuntimeService,
+              SamplerV2 as Sampler
+          )
+
+          results = []
+          raw = {}
+
+          def add_result(exp, status, metric, value=None, details=None):
+              results.append({
+                  "experiment": exp,
+                  "status": status,
+                  "metric": metric,
+                  "value": value,
+                  "details": details
+              })
+
+          def imbalance(values, bits):
+              s0 = sum(v for v, b in zip(values, bits) if b == 0)
+              s1 = sum(v for v, b in zip(values, bits) if b == 1)
+              return abs(s0 - s1)
+
+          def exact_partition(values):
+              best = float("inf")
+              best_bits = None
+              explored = 0
+
+              t0 = time.perf_counter()
+
+              for bits in itertools.product([0, 1], repeat=len(values)):
+                  explored += 1
+                  d = imbalance(values, bits)
+
+                  if d < best:
+                      best = d
+                      best_bits = bits
+
+              elapsed = time.perf_counter() - t0
+
+              return {
+                  "imbalance": best,
+                  "bits": best_bits,
+                  "explored": explored,
+                  "runtime_s": elapsed
+              }
+
+          def changed_assignments(a, b):
+              return sum(x != y for x, y in zip(a, b))
+
+          def local_repair(values, base_bits, affected_indices, radius=1):
+              candidate_indices = set()
+
+              for idx in affected_indices:
+                  lo = max(0, idx - radius)
+                  hi = min(len(values), idx + radius + 1)
+
+                  for j in range(lo, hi):
+                      candidate_indices.add(j)
+
+              candidate_indices = sorted(candidate_indices)
+
+              best = float("inf")
+              best_bits = None
+              explored = 0
+
+              t0 = time.perf_counter()
+
+              for patch in itertools.product(
+                  [0, 1],
+                  repeat=len(candidate_indices)
+              ):
+                  explored += 1
+                  bits = list(base_bits)
+
+                  for idx, val in zip(candidate_indices, patch):
+                      bits[idx] = val
+
+                  d = imbalance(values, bits)
+                  changed = changed_assignments(base_bits, bits)
+
+                  score = d + changed
+
+                  if score < best:
+                      best = score
+                      best_bits = tuple(bits)
+
+              elapsed = time.perf_counter() - t0
+
+              return {
+                  "score": best,
+                  "bits": best_bits,
+                  "imbalance": imbalance(values, best_bits),
+                  "changed_assignments":
+                      changed_assignments(base_bits, best_bits),
+                  "explored": explored,
+                  "runtime_s": elapsed,
+                  "candidate_indices": candidate_indices
+              }
+
+          def make_qaoa(values, gamma, beta):
+              n = len(values)
+              qc = QuantumCircuit(n, n)
+
+              for q in range(n):
+                  qc.h(q)
+
+              for i in range(n):
+                  for j in range(i + 1, n):
+                      w = values[i] * values[j]
+
+                      qc.cx(i, j)
+                      qc.rz(2 * gamma * w, j)
+                      qc.cx(i, j)
+
+              for q in range(n):
+                  qc.rx(2 * beta, q)
+
+              qc.measure(range(n), range(n))
+
+              return qc
+
+          def decode(bitstring):
+              return tuple(int(x) for x in bitstring[::-1])
+
+          def evaluate_counts(values, counts):
+              total = sum(counts.values())
+              expected = 0.0
+
+              best_bits = None
+              best_imb = float("inf")
+
+              for bitstring, count in counts.items():
+                  bits = decode(bitstring)
+                  d = imbalance(values, bits)
+
+                  expected += d * count / total
+
+                  if d < best_imb:
+                      best_imb = d
+                      best_bits = bits
+
+              return {
+                  "expected_imbalance": expected,
+                  "best_bits": best_bits,
+                  "best_imbalance": best_imb
+              }
+
+          # =====================================================
+          # E1 — Baseline
+          # =====================================================
+
+          baseline_values = [3, 5, 7, 9, 11, 13]
+
+          baseline = exact_partition(baseline_values)
+
+          add_result(
+              "E1_baseline_exact",
+              "success",
+              "imbalance",
+              baseline["imbalance"],
+              (
+                  f"bits={baseline['bits']}, "
+                  f"explored={baseline['explored']}, "
+                  f"runtime_s={baseline['runtime_s']:.8f}"
+              )
+          )
+
+          raw["E1"] = baseline
+
+          # =====================================================
+          # E2 — Search for disruptive Terrain perturbation
+          # =====================================================
+
+          disruptive_case = None
+
+          for idx in range(len(baseline_values)):
+              original = baseline_values[idx]
+
+              for new_value in range(1, 31):
+                  if new_value == original:
+                      continue
+
+                  candidate = baseline_values.copy()
+                  candidate[idx] = new_value
+
+                  exact = exact_partition(candidate)
+
+                  changes = changed_assignments(
+                      baseline["bits"],
+                      exact["bits"]
+                  )
+
+                  if changes > 0:
+                      disruptive_case = {
+                          "index": idx,
+                          "old_value": original,
+                          "new_value": new_value,
+                          "values": candidate,
+                          "exact": exact,
+                          "changes": changes
+                      }
+                      break
+
+              if disruptive_case:
+                  break
+
+          if disruptive_case is None:
+              raise RuntimeError(
+                  "Could not find disruptive Terrain perturbation"
+              )
+
+          add_result(
+              "E2_disruptive_terrain_change",
+              "success",
+              "changed_assignments",
+              disruptive_case["changes"],
+              (
+                  f"index={disruptive_case['index']}, "
+                  f"{disruptive_case['old_value']}->"
+                  f"{disruptive_case['new_value']}, "
+                  f"values={disruptive_case['values']}, "
+                  f"exact_bits={disruptive_case['exact']['bits']}, "
+                  f"imbalance={disruptive_case['exact']['imbalance']}"
+              )
+          )
+
+          raw["E2"] = disruptive_case
+
+          # =====================================================
+          # E3 — T3 local repair
+          # =====================================================
+
+          t3 = local_repair(
+              disruptive_case["values"],
+              baseline["bits"],
+              affected_indices=[disruptive_case["index"]],
+              radius=1
+          )
+
+          add_result(
+              "E3_t3_local_repair",
+              "success",
+              "disruption_score",
+              t3["score"],
+              (
+                  f"bits={t3['bits']}, "
+                  f"imbalance={t3['imbalance']}, "
+                  f"changed_assignments="
+                  f"{t3['changed_assignments']}, "
+                  f"candidate_indices="
+                  f"{t3['candidate_indices']}, "
+                  f"explored={t3['explored']}, "
+                  f"runtime_s={t3['runtime_s']:.8f}"
+              )
+          )
+
+          raw["E3"] = t3
+
+          # =====================================================
+          # E4 — Full recompute vs T3 search reduction
+          # =====================================================
+
+          full = disruptive_case["exact"]
+
+          search_reduction = (
+              1.0 - (t3["explored"] / full["explored"])
+          )
+
+          runtime_ratio = (
+              t3["runtime_s"] / full["runtime_s"]
+              if full["runtime_s"] > 0
+              else None
+          )
+
+          quality_gap = (
+              t3["imbalance"] - full["imbalance"]
+          )
+
+          add_result(
+              "E4_t3_vs_full_recompute",
+              "success",
+              "search_reduction_fraction",
+              search_reduction,
+              (
+                  f"full_explored={full['explored']}, "
+                  f"t3_explored={t3['explored']}, "
+                  f"full_runtime_s={full['runtime_s']:.8f}, "
+                  f"t3_runtime_s={t3['runtime_s']:.8f}, "
+                  f"runtime_ratio={runtime_ratio}, "
+                  f"quality_gap={quality_gap}"
+              )
+          )
+
+          raw["E4"] = {
+              "search_reduction_fraction":
+                  search_reduction,
+              "runtime_ratio":
+                  runtime_ratio,
+              "quality_gap":
+                  quality_gap,
+              "full_explored":
+                  full["explored"],
+              "t3_explored":
+                  t3["explored"]
+          }
+
+          # =====================================================
+          # E5 — Sequential Terrain perturbations
+          # =====================================================
+
+          seq_values = disruptive_case["values"].copy()
+          seq_base_bits = t3["bits"]
+
+          sequential_results = []
+
+          for step, delta in enumerate([1, 2, -1], start=1):
+              idx = disruptive_case["index"]
+
+              seq_values[idx] = max(
+                  1,
+                  seq_values[idx] + delta
+              )
+
+              exact = exact_partition(seq_values)
+
+              repair = local_repair(
+                  seq_values,
+                  seq_base_bits,
+                  affected_indices=[idx],
+                  radius=1
+              )
+
+              sequential_results.append({
+                  "step": step,
+                  "values": seq_values.copy(),
+                  "full_imbalance": exact["imbalance"],
+                  "t3_imbalance": repair["imbalance"],
+                  "full_explored": exact["explored"],
+                  "t3_explored": repair["explored"],
+                  "changed_assignments":
+                      repair["changed_assignments"]
+              })
+
+              seq_base_bits = repair["bits"]
+
+          add_result(
+              "E5_sequential_terrain_changes",
+              "success",
+              "steps",
+              len(sequential_results),
+              json.dumps(sequential_results)
+          )
+
+          raw["E5"] = sequential_results
+
+          # =====================================================
+          # E6 — QAOA baseline optimization on Aer
+          # =====================================================
+
+          simulator = AerSimulator()
+
+          gamma_grid = np.linspace(
+              0.0,
+              math.pi,
+              9
+          )
+
+          beta_grid = np.linspace(
+              0.0,
+              math.pi / 2,
+              9
+          )
+
+          qaoa_best = None
+
+          for gamma in gamma_grid:
+              for beta in beta_grid:
+
+                  qc = make_qaoa(
+                      baseline_values,
+                      gamma,
+                      beta
+                  )
+
+                  tqc = transpile(
+                      qc,
+                      simulator,
+                      optimization_level=1
+                  )
+
+                  counts = simulator.run(
+                      tqc,
+                      shots=1024
+                  ).result().get_counts()
+
+                  ev = evaluate_counts(
+                      baseline_values,
+                      counts
+                  )
+
+                  if (
+                      qaoa_best is None
+                      or ev["expected_imbalance"]
+                      < qaoa_best["expected_imbalance"]
+                  ):
+                      qaoa_best = {
+                          "gamma": float(gamma),
+                          "beta": float(beta),
+                          **ev
+                      }
+
+          add_result(
+              "E6_qaoa_baseline",
+              "success",
+              "expected_imbalance",
+              qaoa_best["expected_imbalance"],
+              (
+                  f"gamma={qaoa_best['gamma']}, "
+                  f"beta={qaoa_best['beta']}, "
+                  f"best_imbalance="
+                  f"{qaoa_best['best_imbalance']}"
+              )
+          )
+
+          raw["E6"] = qaoa_best
+
+          # =====================================================
+          # E7 — Reuse QAOA parameters after disruptive change
+          # =====================================================
+
+          qc_changed = make_qaoa(
+              disruptive_case["values"],
+              qaoa_best["gamma"],
+              qaoa_best["beta"]
+          )
+
+          tqc_changed = transpile(
+              qc_changed,
+              simulator,
+              optimization_level=1
+          )
+
+          changed_counts = simulator.run(
+              tqc_changed,
+              shots=1024
+          ).result().get_counts()
+
+          qaoa_changed = evaluate_counts(
+              disruptive_case["values"],
+              changed_counts
+          )
+
+          add_result(
+              "E7_qaoa_parameter_reuse",
+              "success",
+              "expected_imbalance",
+              qaoa_changed["expected_imbalance"],
+              (
+                  f"best_imbalance="
+                  f"{qaoa_changed['best_imbalance']}, "
+                  f"best_bits={qaoa_changed['best_bits']}"
+              )
+          )
+
+          raw["E7"] = qaoa_changed
+
+          # =====================================================
+          # E8 — IBM backend discovery
+          # =====================================================
+
+          token = os.environ.get("IBM_QUANTUM_TOKEN")
+          instance = os.environ.get("IBM_QUANTUM_INSTANCE")
+
+          backend = None
+
+          try:
+              kwargs = {
+                  "channel": "ibm_quantum_platform",
+                  "token": token
+              }
+
+              if instance:
+                  kwargs["instance"] = instance
+
+              service = QiskitRuntimeService(**kwargs)
+
+              backends = service.backends(
+                  operational=True,
+                  simulator=False
+              )
+
+              eligible = [
+                  b for b in backends
+                  if b.num_qubits >= 3
+              ]
+
+              backend = min(
+                  eligible,
+                  key=lambda b:
+                      b.status().pending_jobs
+              )
+
+              add_result(
+                  "E8_ibm_backend_selection",
+                  "success",
+                  "num_qubits",
+                  backend.num_qubits,
+                  (
+                      f"name={backend.name}, "
+                      f"pending_jobs="
+                      f"{backend.status().pending_jobs}"
+                  )
+              )
+
+              raw["E8"] = {
+                  "backend": backend.name,
+                  "num_qubits":
+                      backend.num_qubits,
+                  "pending_jobs":
+                      backend.status().pending_jobs
+              }
+
+          except Exception as e:
+
+              add_result(
+                  "E8_ibm_backend_selection",
+                  "failed",
+                  "error",
+                  None,
+                  str(e)
+              )
+
+              raw["E8_error"] = str(e)
+
+          # =====================================================
+          # E9 — Real QPU GHZ control run
+          # =====================================================
+
+          if backend is not None:
+
+              try:
+                  ghz = QuantumCircuit(3)
+
+                  ghz.h(0)
+                  ghz.cx(0, 1)
+                  ghz.cx(1, 2)
+                  ghz.measure_all()
+
+                  isa = transpile(
+                      ghz,
+                      backend=backend,
+                      optimization_level=3
+                  )
+
+                  sampler = Sampler(
+                      mode=backend
+                  )
+
+                  job = sampler.run(
+                      [isa],
+                      shots=256
+                  )
+
+                  job_id = job.job_id()
+
+                  qpu_result = job.result()[0]
+
+                  counts = (
+                      qpu_result
+                      .data
+                      .meas
+                      .get_counts()
+                  )
+
+                  total = sum(counts.values())
+
+                  good = (
+                      counts.get("000", 0)
+                      + counts.get("111", 0)
+                  )
+
+                  success_fraction = (
+                      good / total
+                      if total
+                      else 0.0
+                  )
+
+                  add_result(
+                      "E9_real_qpu_ghz_control",
+                      "success",
+                      "ghz_success_fraction",
+                      success_fraction,
+                      (
+                          f"backend={backend.name}, "
+                          f"job_id={job_id}, "
+                          f"counts={counts}"
+                      )
+                  )
+
+                  raw["E9"] = {
+                      "backend": backend.name,
+                      "job_id": job_id,
+                      "counts": counts,
+                      "success_fraction":
+                          success_fraction
+                  }
+
+              except Exception as e:
+
+                  add_result(
+                      "E9_real_qpu_ghz_control",
+                      "failed",
+                      "error",
+                      None,
+                      str(e)
+                  )
+
+                  raw["E9_error"] = str(e)
+
+          # =====================================================
+          # E10 — Core T3 hypothesis result
+          # =====================================================
+
+          hypothesis_supported = (
+              t3["explored"] < full["explored"]
+              and t3["imbalance"]
+                  <= full["imbalance"] + 1
+          )
+
+          add_result(
+              "E10_t3_hypothesis_test",
+              "success",
+              "supported",
+              int(hypothesis_supported),
+              (
+                  f"search_reduction="
+                  f"{search_reduction:.6f}, "
+                  f"quality_gap={quality_gap}, "
+                  f"t3_changed_assignments="
+                  f"{t3['changed_assignments']}"
+              )
+          )
+
+          raw["E10"] = {
+              "supported":
+                  hypothesis_supported,
+              "search_reduction":
+                  search_reduction,
+              "quality_gap":
+                  quality_gap,
+              "changed_assignments":
+                  t3["changed_assignments"]
+          }
+
+          # =====================================================
+          # Export
+          # =====================================================
+
+          df = pd.DataFrame(results)
+
+          print(
+              "\n========== QGSS 2026 T3 BENCHMARK V3 ==========\n"
+          )
+
+          print(
+              df.to_string(index=False)
+          )
+
+          df.to_csv(
+              "qgss_t3_v3_results.csv",
+              index=False
+          )
+
+          with open(
+              "qgss_t3_v3_results.json",
+              "w"
+          ) as f:
+              json.dump(
+                  results,
+                  f,
+                  indent=2,
+                  default=str
+              )
+
+          with open(
+              "qgss_t3_v3_raw.json",
+              "w"
+          ) as f:
+              json.dump(
+                  raw,
+                  f,
+                  indent=2,
+                  default=str
+              )
+
+          print(
+              "\nSaved V3 result files."
+          )
+
+          PY
+
+      - name: Upload V3 results
+        uses: actions/upload-artifact@v4
+        with:
+          name: qgss-t3-v3-results
+          path: |
+            qgss_t3_v3_results.csv
+            qgss_t3_v3_results.json
+            qgss_t3_v3_raw.json
