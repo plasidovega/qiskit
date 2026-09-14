@@ -1,0 +1,52 @@
+name: Test IBM Quantum Integration
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-qiskit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Qiskit Runtime
+        run: |
+          python -m pip install --upgrade pip
+          pip install qiskit qiskit-ibm-runtime
+
+      - name: Test IBM Quantum connection
+        env:
+          IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
+          IBM_QUANTUM_INSTANCE: ${{ secrets.IBM_QUANTUM_INSTANCE }}
+        run: |
+          python - <<'PY'
+          import os
+          from qiskit_ibm_runtime import QiskitRuntimeService
+
+          token = os.environ["IBM_QUANTUM_TOKEN"]
+          instance = os.environ.get("IBM_QUANTUM_INSTANCE")
+
+          print("Token received from GitHub Secrets:", bool(token))
+          print("Instance configured:", bool(instance))
+
+          service = QiskitRuntimeService(
+              channel="ibm_quantum_platform",
+              token=token,
+              instance=instance if instance else None
+          )
+
+          backends = service.backends()
+
+          print("\nIBM Quantum authentication SUCCESS")
+          print("Accessible backends:", len(backends))
+
+          for backend in backends[:10]:
+              print(" -", backend.name)
+          PY
