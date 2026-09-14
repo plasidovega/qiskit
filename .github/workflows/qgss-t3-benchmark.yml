@@ -1,0 +1,235 @@
+name: QGSS 2026 T3 Benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install qiskit qiskit-aer qiskit-ibm-runtime numpy pandas
+
+      - name: Run filtered QGSS/T3 benchmark
+        env:
+          IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
+          IBM_QUANTUM_INSTANCE: ${{ secrets.IBM_QUANTUM_INSTANCE }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import itertools
+          import numpy as np
+          import pandas as pd
+
+          from qiskit import QuantumCircuit, transpile
+          from qiskit_aer import AerSimulator
+          from qiskit_ibm_runtime import QiskitRuntimeService
+
+          results = []
+
+          # --------------------------------------------------
+          # E1 — QGSS Lab 4b-style partition baseline
+          # --------------------------------------------------
+          values = [3, 5, 7, 9, 11, 13]
+          total = sum(values)
+
+          best_diff = float("inf")
+          best_partition = None
+
+          for bits in itertools.product([0, 1], repeat=len(values)):
+              a = [v for v, b in zip(values, bits) if b == 0]
+              b = [v for v, b in zip(values, bits) if b == 1]
+
+              diff = abs(sum(a) - sum(b))
+
+              if diff < best_diff:
+                  best_diff = diff
+                  best_partition = (a, b)
+
+          results.append({
+              "experiment": "E1_partition_baseline",
+              "status": "success",
+              "input": str(values),
+              "metric": "imbalance",
+              "value": best_diff,
+              "details": str(best_partition)
+          })
+
+          # --------------------------------------------------
+          # E2 — Terrain change: modify one weight
+          # --------------------------------------------------
+          changed_values = [3, 5, 7, 9, 11, 14]
+
+          best_diff2 = float("inf")
+          best_partition2 = None
+
+          for bits in itertools.product([0, 1], repeat=len(changed_values)):
+              a = [v for v, b in zip(changed_values, bits) if b == 0]
+              b = [v for v, b in zip(changed_values, bits) if b == 1]
+
+              diff = abs(sum(a) - sum(b))
+
+              if diff < best_diff2:
+                  best_diff2 = diff
+                  best_partition2 = (a, b)
+
+          results.append({
+              "experiment": "E2_terrain_change",
+              "status": "success",
+              "input": str(changed_values),
+              "metric": "imbalance",
+              "value": best_diff2,
+              "details": str(best_partition2)
+          })
+
+          # --------------------------------------------------
+          # E3 — T3 repair disruption metric
+          # --------------------------------------------------
+          original_assignment = {
+              3: 0,
+              5: 0,
+              7: 0,
+              9: 0,
+              11: 1,
+              13: 1
+          }
+
+          repaired_values = [3, 5, 7, 9, 11, 14]
+
+          best_score = float("inf")
+          best_repair = None
+
+          for bits in itertools.product([0, 1], repeat=len(repaired_values)):
+              s0 = sum(v for v, b in zip(repaired_values, bits) if b == 0)
+              s1 = sum(v for v, b in zip(repaired_values, bits) if b == 1)
+
+              imbalance = abs(s0 - s1)
+
+              changed_assignments = 0
+              for v, b in zip(repaired_values[:-1], bits[:-1]):
+                  if original_assignment.get(v) != b:
+                      changed_assignments += 1
+
+              disruption_score = imbalance + changed_assignments
+
+              if disruption_score < best_score:
+                  best_score = disruption_score
+                  best_repair = {
+                      "assignment": bits,
+                      "imbalance": imbalance,
+                      "changed_assignments": changed_assignments
+                  }
+
+          results.append({
+              "experiment": "E3_t3_local_repair",
+              "status": "success",
+              "metric": "disruption_score",
+              "value": best_score,
+              "details": str(best_repair)
+          })
+
+          # --------------------------------------------------
+          # E4 — noisy topology simulation
+          # --------------------------------------------------
+          qc = QuantumCircuit(3, 3)
+          qc.h(0)
+          qc.cx(0, 1)
+          qc.cx(1, 2)
+          qc.measure([0,1,2], [0,1,2])
+
+          simulator = AerSimulator()
+
+          tqc = transpile(qc, simulator)
+          sim_result = simulator.run(tqc, shots=1024).result()
+          counts = sim_result.get_counts()
+
+          results.append({
+              "experiment": "E4_topology_simulation",
+              "status": "success",
+              "metric": "measurement_distribution",
+              "value": len(counts),
+              "details": str(counts)
+          })
+
+          # --------------------------------------------------
+          # E5 — IBM Quantum authentication/backend topology
+          # --------------------------------------------------
+          token = os.environ.get("IBM_QUANTUM_TOKEN")
+          instance = os.environ.get("IBM_QUANTUM_INSTANCE")
+
+          try:
+              kwargs = {
+                  "channel": "ibm_quantum_platform",
+                  "token": token
+              }
+
+              if instance:
+                  kwargs["instance"] = instance
+
+              service = QiskitRuntimeService(**kwargs)
+              backends = service.backends()
+
+              results.append({
+                  "experiment": "E5_ibm_backend_discovery",
+                  "status": "success",
+                  "metric": "backend_count",
+                  "value": len(backends),
+                  "details": ", ".join(b.name for b in backends[:10])
+              })
+
+              if backends:
+                  backend = backends[0]
+
+                  results.append({
+                      "experiment": "E6_selected_backend",
+                      "status": "success",
+                      "metric": "backend",
+                      "value": backend.num_qubits,
+                      "details": backend.name
+                  })
+
+          except Exception as e:
+              results.append({
+                  "experiment": "E5_ibm_backend_discovery",
+                  "status": "failed",
+                  "metric": "error",
+                  "value": None,
+                  "details": str(e)
+              })
+
+          # --------------------------------------------------
+          # Export
+          # --------------------------------------------------
+          df = pd.DataFrame(results)
+
+          print("\n========== QGSS/T3 BENCHMARK ==========\n")
+          print(df.to_string(index=False))
+
+          df.to_csv("qgss_t3_results.csv", index=False)
+
+          with open("qgss_t3_results.json", "w") as f:
+              json.dump(results, f, indent=2)
+
+          print("\nSaved qgss_t3_results.csv")
+          print("Saved qgss_t3_results.json")
+          PY
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: qgss-t3-results
+          path: |
+            qgss_t3_results.csv
+            qgss_t3_results.json
