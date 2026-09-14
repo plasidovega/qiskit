@@ -1,0 +1,747 @@
+name: QGSS 2026 T3 Benchmark V2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark-v2:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install qiskit qiskit-aer qiskit-ibm-runtime numpy pandas scipy
+
+      - name: Run QGSS T3 Benchmark V2
+        env:
+          IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
+          IBM_QUANTUM_INSTANCE: ${{ secrets.IBM_QUANTUM_INSTANCE }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import math
+          import time
+          import itertools
+          import numpy as np
+          import pandas as pd
+
+          from qiskit import QuantumCircuit, transpile
+          from qiskit_aer import AerSimulator
+          from qiskit_ibm_runtime import (
+              QiskitRuntimeService,
+              SamplerV2 as Sampler
+          )
+
+          # ==========================================================
+          # COMMON UTILITIES
+          # ==========================================================
+
+          results = []
+          raw_results = {}
+
+          def record(
+              experiment,
+              status,
+              metric,
+              value=None,
+              details=None,
+              extra=None
+          ):
+              row = {
+                  "experiment": experiment,
+                  "status": status,
+                  "metric": metric,
+                  "value": value,
+                  "details": details
+              }
+
+              if extra:
+                  row.update(extra)
+
+              results.append(row)
+
+          def exact_partition(values):
+              best_diff = float("inf")
+              best_bits = None
+
+              for bits in itertools.product([0, 1], repeat=len(values)):
+                  s0 = sum(v for v, b in zip(values, bits) if b == 0)
+                  s1 = sum(v for v, b in zip(values, bits) if b == 1)
+
+                  diff = abs(s0 - s1)
+
+                  if diff < best_diff:
+                      best_diff = diff
+                      best_bits = bits
+
+              a = [v for v, b in zip(values, best_bits) if b == 0]
+              b = [v for v, b in zip(values, best_bits) if b == 1]
+
+              return best_diff, best_bits, a, b
+
+          def imbalance(values, bits):
+              s0 = sum(v for v, b in zip(values, bits) if b == 0)
+              s1 = sum(v for v, b in zip(values, bits) if b == 1)
+              return abs(s0 - s1)
+
+          def changed_assignments(bits_a, bits_b):
+              return sum(x != y for x, y in zip(bits_a, bits_b))
+
+          # ==========================================================
+          # E1 — EXACT QGSS LAB 4B-STYLE PARTITION BASELINE
+          # ==========================================================
+
+          values = [3, 5, 7, 9, 11, 13]
+
+          best_diff, base_bits, base_a, base_b = exact_partition(values)
+
+          record(
+              "E1_exact_partition_baseline",
+              "success",
+              "imbalance",
+              best_diff,
+              f"A={base_a}, B={base_b}, bits={base_bits}"
+          )
+
+          raw_results["E1"] = {
+              "values": values,
+              "bits": base_bits,
+              "partition_A": base_a,
+              "partition_B": base_b,
+              "imbalance": best_diff
+          }
+
+          # ==========================================================
+          # E2 — TERRAIN CHANGE
+          # ==========================================================
+
+          changed_values = [3, 5, 7, 9, 11, 14]
+
+          diff2, changed_bits, changed_a, changed_b = exact_partition(
+              changed_values
+          )
+
+          record(
+              "E2_terrain_change_exact_recompute",
+              "success",
+              "imbalance",
+              diff2,
+              f"A={changed_a}, B={changed_b}, bits={changed_bits}"
+          )
+
+          raw_results["E2"] = {
+              "values": changed_values,
+              "bits": changed_bits,
+              "partition_A": changed_a,
+              "partition_B": changed_b,
+              "imbalance": diff2
+          }
+
+          # ==========================================================
+          # E3 — T3 MINIMAL-DISRUPTION REPAIR
+          # ==========================================================
+
+          alpha = 1.0
+          beta = 1.0
+
+          best_score = float("inf")
+          best_repair_bits = None
+          best_repair_imbalance = None
+          best_changed = None
+
+          for bits in itertools.product([0, 1], repeat=len(changed_values)):
+
+              current_imbalance = imbalance(changed_values, bits)
+
+              changed_count = changed_assignments(
+                  base_bits,
+                  bits
+              )
+
+              disruption_score = (
+                  alpha * current_imbalance
+                  + beta * changed_count
+              )
+
+              if disruption_score < best_score:
+                  best_score = disruption_score
+                  best_repair_bits = bits
+                  best_repair_imbalance = current_imbalance
+                  best_changed = changed_count
+
+          repair_a = [
+              v for v, b in zip(changed_values, best_repair_bits) if b == 0
+          ]
+
+          repair_b = [
+              v for v, b in zip(changed_values, best_repair_bits) if b == 1
+          ]
+
+          record(
+              "E3_t3_minimal_disruption_repair",
+              "success",
+              "disruption_score",
+              best_score,
+              (
+                  f"A={repair_a}, B={repair_b}, "
+                  f"imbalance={best_repair_imbalance}, "
+                  f"changed_assignments={best_changed}, "
+                  f"bits={best_repair_bits}"
+              )
+          )
+
+          raw_results["E3"] = {
+              "bits": best_repair_bits,
+              "partition_A": repair_a,
+              "partition_B": repair_b,
+              "imbalance": best_repair_imbalance,
+              "changed_assignments": best_changed,
+              "disruption_score": best_score
+          }
+
+          # ==========================================================
+          # QAOA UTILITIES
+          # ==========================================================
+
+          def qaoa_partition_circuit(values, gamma, beta):
+              n = len(values)
+
+              qc = QuantumCircuit(n, n)
+
+              # Initial |+> state
+              for q in range(n):
+                  qc.h(q)
+
+              # Cost Hamiltonian:
+              # H = sum_(i<j) a_i a_j Z_i Z_j
+              for i in range(n):
+                  for j in range(i + 1, n):
+                      weight = values[i] * values[j]
+
+                      qc.cx(i, j)
+                      qc.rz(2 * gamma * weight, j)
+                      qc.cx(i, j)
+
+              # Mixer
+              for q in range(n):
+                  qc.rx(2 * beta, q)
+
+              qc.measure(range(n), range(n))
+
+              return qc
+
+          def bitstring_to_assignment(bitstring):
+              # Qiskit bitstrings are little-endian relative to qubit indexing
+              return tuple(
+                  int(bit)
+                  for bit in bitstring[::-1]
+              )
+
+          def evaluate_counts(values, counts):
+              total_shots = sum(counts.values())
+
+              expected_imbalance = 0.0
+              best_seen = None
+              best_seen_imbalance = float("inf")
+              best_seen_count = 0
+
+              for bitstring, count in counts.items():
+                  bits = bitstring_to_assignment(bitstring)
+
+                  diff = imbalance(values, bits)
+
+                  expected_imbalance += (
+                      diff * count / total_shots
+                  )
+
+                  if diff < best_seen_imbalance:
+                      best_seen_imbalance = diff
+                      best_seen = bits
+                      best_seen_count = count
+
+              return {
+                  "expected_imbalance": expected_imbalance,
+                  "best_seen_bits": best_seen,
+                  "best_seen_imbalance": best_seen_imbalance,
+                  "best_seen_count": best_seen_count,
+                  "total_shots": total_shots
+              }
+
+          # ==========================================================
+          # E4 — QAOA GRID SEARCH ON AER
+          # ==========================================================
+
+          simulator = AerSimulator()
+
+          gamma_grid = np.linspace(
+              0.0,
+              math.pi,
+              13
+          )
+
+          beta_grid = np.linspace(
+              0.0,
+              math.pi / 2,
+              13
+          )
+
+          qaoa_best_score = float("inf")
+          qaoa_best_gamma = None
+          qaoa_best_beta = None
+          qaoa_best_eval = None
+          qaoa_best_counts = None
+
+          shots = 2048
+
+          for gamma in gamma_grid:
+              for beta in beta_grid:
+
+                  qc = qaoa_partition_circuit(
+                      values,
+                      gamma,
+                      beta
+                  )
+
+                  tqc = transpile(
+                      qc,
+                      simulator,
+                      optimization_level=1
+                  )
+
+                  sim_result = simulator.run(
+                      tqc,
+                      shots=shots
+                  ).result()
+
+                  counts = sim_result.get_counts()
+
+                  eval_result = evaluate_counts(
+                      values,
+                      counts
+                  )
+
+                  score = eval_result["expected_imbalance"]
+
+                  if score < qaoa_best_score:
+                      qaoa_best_score = score
+                      qaoa_best_gamma = gamma
+                      qaoa_best_beta = beta
+                      qaoa_best_eval = eval_result
+                      qaoa_best_counts = counts
+
+          record(
+              "E4_qaoa_aer_grid_search",
+              "success",
+              "expected_imbalance",
+              qaoa_best_score,
+              (
+                  f"gamma={qaoa_best_gamma:.6f}, "
+                  f"beta={qaoa_best_beta:.6f}, "
+                  f"best_seen_imbalance="
+                  f"{qaoa_best_eval['best_seen_imbalance']}, "
+                  f"best_seen_bits="
+                  f"{qaoa_best_eval['best_seen_bits']}"
+              )
+          )
+
+          raw_results["E4"] = {
+              "gamma": float(qaoa_best_gamma),
+              "beta": float(qaoa_best_beta),
+              "expected_imbalance": qaoa_best_score,
+              "best_seen_bits": qaoa_best_eval["best_seen_bits"],
+              "best_seen_imbalance":
+                  qaoa_best_eval["best_seen_imbalance"],
+              "counts": qaoa_best_counts
+          }
+
+          # ==========================================================
+          # E5 — REUSE SAME QAOA PARAMETERS AFTER TERRAIN CHANGE
+          # ==========================================================
+
+          changed_qc = qaoa_partition_circuit(
+              changed_values,
+              qaoa_best_gamma,
+              qaoa_best_beta
+          )
+
+          changed_tqc = transpile(
+              changed_qc,
+              simulator,
+              optimization_level=1
+          )
+
+          changed_result = simulator.run(
+              changed_tqc,
+              shots=shots
+          ).result()
+
+          changed_counts = changed_result.get_counts()
+
+          changed_eval = evaluate_counts(
+              changed_values,
+              changed_counts
+          )
+
+          changed_from_base = changed_assignments(
+              base_bits,
+              changed_eval["best_seen_bits"]
+          )
+
+          record(
+              "E5_qaoa_parameter_reuse_after_terrain_change",
+              "success",
+              "expected_imbalance",
+              changed_eval["expected_imbalance"],
+              (
+                  f"best_seen_imbalance="
+                  f"{changed_eval['best_seen_imbalance']}, "
+                  f"changed_assignments_from_baseline="
+                  f"{changed_from_base}, "
+                  f"best_seen_bits="
+                  f"{changed_eval['best_seen_bits']}"
+              )
+          )
+
+          raw_results["E5"] = {
+              "expected_imbalance":
+                  changed_eval["expected_imbalance"],
+              "best_seen_bits":
+                  changed_eval["best_seen_bits"],
+              "best_seen_imbalance":
+                  changed_eval["best_seen_imbalance"],
+              "changed_assignments_from_baseline":
+                  changed_from_base,
+              "counts":
+                  changed_counts
+          }
+
+          # ==========================================================
+          # E6 — IBM QUANTUM BACKEND DISCOVERY
+          # ==========================================================
+
+          token = os.environ.get(
+              "IBM_QUANTUM_TOKEN"
+          )
+
+          instance = os.environ.get(
+              "IBM_QUANTUM_INSTANCE"
+          )
+
+          service = None
+          backend = None
+
+          try:
+
+              kwargs = {
+                  "channel": "ibm_quantum_platform",
+                  "token": token
+              }
+
+              if instance:
+                  kwargs["instance"] = instance
+
+              service = QiskitRuntimeService(
+                  **kwargs
+              )
+
+              backends = service.backends(
+                  operational=True,
+                  simulator=False
+              )
+
+              backend_names = [
+                  b.name for b in backends
+              ]
+
+              record(
+                  "E6_ibm_backend_discovery",
+                  "success",
+                  "backend_count",
+                  len(backends),
+                  ", ".join(backend_names[:20])
+              )
+
+              raw_results["E6"] = {
+                  "backend_names":
+                      backend_names
+              }
+
+              # Prefer least busy backend with >= 3 qubits
+              eligible = [
+                  b for b in backends
+                  if b.num_qubits >= 3
+              ]
+
+              backend = min(
+                  eligible,
+                  key=lambda b: (
+                      b.status().pending_jobs
+                      if hasattr(b.status(), "pending_jobs")
+                      else 999999
+                  )
+              )
+
+              record(
+                  "E7_selected_real_backend",
+                  "success",
+                  "num_qubits",
+                  backend.num_qubits,
+                  (
+                      f"name={backend.name}, "
+                      f"pending_jobs="
+                      f"{backend.status().pending_jobs}"
+                  )
+              )
+
+              raw_results["E7"] = {
+                  "backend": backend.name,
+                  "num_qubits": backend.num_qubits,
+                  "pending_jobs":
+                      backend.status().pending_jobs
+              }
+
+          except Exception as e:
+
+              record(
+                  "E6_ibm_backend_discovery",
+                  "failed",
+                  "error",
+                  None,
+                  str(e)
+              )
+
+              raw_results["E6_error"] = str(e)
+
+          # ==========================================================
+          # E8 — REAL IBM QPU GHZ EXECUTION
+          # ==========================================================
+
+          if backend is not None:
+
+              try:
+
+                  ghz = QuantumCircuit(3)
+
+                  ghz.h(0)
+                  ghz.cx(0, 1)
+                  ghz.cx(1, 2)
+
+                  ghz.measure_all()
+
+                  ghz_isa = transpile(
+                      ghz,
+                      backend=backend,
+                      optimization_level=3
+                  )
+
+                  sampler = Sampler(
+                      mode=backend
+                  )
+
+                  print(
+                      "\nSubmitting real IBM Quantum job..."
+                  )
+
+                  qpu_job = sampler.run(
+                      [ghz_isa],
+                      shots=256
+                  )
+
+                  job_id = qpu_job.job_id()
+
+                  print(
+                      f"IBM Quantum Job ID: {job_id}"
+                  )
+
+                  qpu_result = qpu_job.result()
+
+                  pub_result = qpu_result[0]
+
+                  qpu_counts = (
+                      pub_result
+                      .data
+                      .meas
+                      .get_counts()
+                  )
+
+                  total = sum(
+                      qpu_counts.values()
+                  )
+
+                  good = (
+                      qpu_counts.get("000", 0)
+                      + qpu_counts.get("111", 0)
+                  )
+
+                  ghz_success_fraction = (
+                      good / total
+                      if total
+                      else 0.0
+                  )
+
+                  record(
+                      "E8_real_ibm_qpu_ghz",
+                      "success",
+                      "ghz_success_fraction",
+                      ghz_success_fraction,
+                      (
+                          f"backend={backend.name}, "
+                          f"job_id={job_id}, "
+                          f"counts={qpu_counts}"
+                      )
+                  )
+
+                  raw_results["E8"] = {
+                      "backend":
+                          backend.name,
+                      "job_id":
+                          job_id,
+                      "counts":
+                          qpu_counts,
+                      "ghz_success_fraction":
+                          ghz_success_fraction
+                  }
+
+              except Exception as e:
+
+                  record(
+                      "E8_real_ibm_qpu_ghz",
+                      "failed",
+                      "error",
+                      None,
+                      str(e)
+                  )
+
+                  raw_results["E8_error"] = str(e)
+
+          # ==========================================================
+          # E9 — T3 VS FULL-RECOMPUTE SUMMARY
+          # ==========================================================
+
+          exact_changed_assignments = changed_assignments(
+              base_bits,
+              changed_bits
+          )
+
+          t3_changed_assignments = changed_assignments(
+              base_bits,
+              best_repair_bits
+          )
+
+          comparison = {
+              "full_recompute": {
+                  "imbalance":
+                      diff2,
+                  "changed_assignments":
+                      exact_changed_assignments,
+                  "bits":
+                      changed_bits
+              },
+              "t3_repair": {
+                  "imbalance":
+                      best_repair_imbalance,
+                  "changed_assignments":
+                      t3_changed_assignments,
+                  "disruption_score":
+                      best_score,
+                  "bits":
+                      best_repair_bits
+              }
+          }
+
+          record(
+              "E9_t3_vs_full_recompute",
+              "success",
+              "changed_assignments",
+              t3_changed_assignments,
+              json.dumps(
+                  comparison,
+                  default=str
+              )
+          )
+
+          raw_results["E9"] = comparison
+
+          # ==========================================================
+          # EXPORT
+          # ==========================================================
+
+          df = pd.DataFrame(
+              results
+          )
+
+          print(
+              "\n"
+              "========== QGSS 2026 T3 BENCHMARK V2 =========="
+              "\n"
+          )
+
+          print(
+              df.to_string(
+                  index=False
+              )
+          )
+
+          df.to_csv(
+              "qgss_t3_v2_results.csv",
+              index=False
+          )
+
+          with open(
+              "qgss_t3_v2_results.json",
+              "w"
+          ) as f:
+              json.dump(
+                  results,
+                  f,
+                  indent=2,
+                  default=str
+              )
+
+          with open(
+              "qgss_t3_v2_raw.json",
+              "w"
+          ) as f:
+              json.dump(
+                  raw_results,
+                  f,
+                  indent=2,
+                  default=str
+              )
+
+          print(
+              "\nSaved:"
+          )
+
+          print(
+              "qgss_t3_v2_results.csv"
+          )
+
+          print(
+              "qgss_t3_v2_results.json"
+          )
+
+          print(
+              "qgss_t3_v2_raw.json"
+          )
+
+          PY
+
+      - name: Upload V2 results
+        uses: actions/upload-artifact@v4
+        with:
+          name: qgss-t3-v2-results
+          path: |
+            qgss_t3_v2_results.csv
+            qgss_t3_v2_results.json
+            qgss_t3_v2_raw.json
