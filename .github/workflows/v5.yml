@@ -1,0 +1,944 @@
+name: QGSS T3 Benchmark V5 - IBM Premium Compute
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_real_qpu:
+        description: "Execute IBM QPU experiments"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+      premium_mode:
+        description: "Enable expensive resilience experiments"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+      shots:
+        description: "Shots per hardware experiment"
+        required: true
+        default: "4096"
+
+permissions:
+  contents: read
+
+jobs:
+  t3-v5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
+      IBM_QUANTUM_INSTANCE: ${{ secrets.IBM_QUANTUM_INSTANCE }}
+      RUN_REAL_QPU: ${{ inputs.run_real_qpu }}
+      PREMIUM_MODE: ${{ inputs.premium_mode }}
+      QPU_SHOTS: ${{ inputs.shots }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install high-end Qiskit stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            qiskit \
+            qiskit-aer \
+            qiskit-ibm-runtime \
+            qiskit-optimization \
+            qiskit-algorithms \
+            networkx \
+            scipy \
+            numpy \
+            pandas
+
+      - name: Create V5 benchmark
+        run: |
+          cat > /tmp/t3_v5.py <<'PY'
+          import os
+          import json
+          import time
+          import itertools
+          import random
+
+          import numpy as np
+          import pandas as pd
+          import networkx as nx
+
+          from qiskit import QuantumCircuit
+          from qiskit.quantum_info import SparsePauliOp
+          from qiskit.transpiler import generate_preset_pass_manager
+          from qiskit_aer import AerSimulator
+
+          from qiskit_ibm_runtime import (
+              QiskitRuntimeService,
+              EstimatorV2,
+              SamplerV2,
+          )
+
+          SEED = 42
+          random.seed(SEED)
+          np.random.seed(SEED)
+
+          RUN_QPU = os.getenv(
+              "RUN_REAL_QPU", "false"
+          ).lower() == "true"
+
+          PREMIUM = os.getenv(
+              "PREMIUM_MODE", "false"
+          ).lower() == "true"
+
+          SHOTS = int(
+              os.getenv("QPU_SHOTS", "4096")
+          )
+
+          # Hard safety ceiling.
+          SHOTS = min(SHOTS, 20000)
+
+          records = []
+          raw = {}
+
+          print("=" * 70)
+          print("T3 V5 — TOPOLOGY-AWARE ADAPTIVE REPAIR")
+          print("=" * 70)
+
+
+          # ------------------------------------------------------------
+          # T3 graph construction
+          # ------------------------------------------------------------
+
+          def make_graph(n, seed):
+              rng = np.random.default_rng(seed)
+
+              G = nx.connected_watts_strogatz_graph(
+                  n=n,
+                  k=4,
+                  p=0.20,
+                  seed=seed
+              )
+
+              for u, v in G.edges:
+                  G[u][v]["weight"] = float(
+                      rng.uniform(1.0, 10.0)
+                  )
+
+              return G
+
+
+          def terrain(G):
+              return {
+                  e: G.edges[e]["weight"]
+                  for e in G.edges
+              }
+
+
+          def trail_cost(G, path):
+              return sum(
+                  G[a][b]["weight"]
+                  for a, b in zip(
+                      path[:-1],
+                      path[1:]
+                  )
+              )
+
+
+          def global_recompute(G, source, target):
+              t0 = time.perf_counter()
+
+              path = nx.shortest_path(
+                  G,
+                  source,
+                  target,
+                  weight="weight"
+              )
+
+              runtime = time.perf_counter() - t0
+
+              return {
+                  "path": path,
+                  "cost": trail_cost(G, path),
+                  "runtime": runtime
+              }
+
+
+          # ------------------------------------------------------------
+          # Adaptive T3 topology repair
+          # ------------------------------------------------------------
+
+          def adaptive_repair(
+              G,
+              old_path,
+              source,
+              target,
+              changed_nodes,
+              global_cost,
+              epsilon=0.05
+          ):
+
+              t0 = time.perf_counter()
+
+              affected = set(changed_nodes)
+
+              history = []
+
+              for radius in range(
+                  0,
+                  nx.diameter(G) + 1
+              ):
+
+                  frontier = set(affected)
+
+                  for _ in range(radius):
+                      frontier |= {
+                          nbr
+                          for n in list(frontier)
+                          for nbr in G.neighbors(n)
+                      }
+
+                  # Preserve unaffected trail prefix/suffix
+                  impacted_positions = [
+                      i
+                      for i, node in enumerate(old_path)
+                      if node in frontier
+                  ]
+
+                  if not impacted_positions:
+                      history.append({
+                          "radius": radius,
+                          "frontier_size": len(frontier),
+                          "status": "no trail impact"
+                      })
+                      continue
+
+                  left_i = max(
+                      0,
+                      min(impacted_positions) - 1
+                  )
+
+                  right_i = min(
+                      len(old_path) - 1,
+                      max(impacted_positions) + 1
+                  )
+
+                  left = old_path[left_i]
+                  right = old_path[right_i]
+
+                  subnodes = set(frontier)
+                  subnodes.add(left)
+                  subnodes.add(right)
+
+                  H = G.subgraph(subnodes).copy()
+
+                  try:
+                      local = nx.shortest_path(
+                          H,
+                          left,
+                          right,
+                          weight="weight"
+                      )
+                  except nx.NetworkXNoPath:
+                      history.append({
+                          "radius": radius,
+                          "frontier_size": len(frontier),
+                          "status": "no local path"
+                      })
+                      continue
+
+                  repaired = (
+                      old_path[:left_i]
+                      + local
+                      + old_path[right_i + 1:]
+                  )
+
+                  # remove immediate duplicates
+                  cleaned = [repaired[0]]
+
+                  for node in repaired[1:]:
+                      if node != cleaned[-1]:
+                          cleaned.append(node)
+
+                  try:
+                      cost = trail_cost(
+                          G,
+                          cleaned
+                      )
+                  except Exception:
+                      continue
+
+                  changed_edges = len(
+                      set(zip(
+                          old_path[:-1],
+                          old_path[1:]
+                      ))
+                      ^
+                      set(zip(
+                          cleaned[:-1],
+                          cleaned[1:]
+                      ))
+                  )
+
+                  ratio = (
+                      cost / global_cost
+                      if global_cost > 0
+                      else 1
+                  )
+
+                  history.append({
+                      "radius": radius,
+                      "frontier_size": len(frontier),
+                      "cost": cost,
+                      "optimality_ratio": ratio,
+                      "changed_edges": changed_edges
+                  })
+
+                  if cost <= global_cost * (1 + epsilon):
+
+                      return {
+                          "path": cleaned,
+                          "cost": cost,
+                          "radius": radius,
+                          "frontier_size":
+                              len(frontier),
+                          "changed_edges":
+                              changed_edges,
+                          "runtime":
+                              time.perf_counter() - t0,
+                          "history": history,
+                          "success": True
+                      }
+
+              return {
+                  "success": False,
+                  "history": history,
+                  "runtime":
+                      time.perf_counter() - t0
+              }
+
+
+          # ------------------------------------------------------------
+          # E1–E4: Scaling experiment
+          # ------------------------------------------------------------
+
+          print("\nE1-E4: CLASSICAL T3 SCALING")
+
+          sizes = [32, 64, 128, 256]
+
+          if PREMIUM:
+              sizes += [512, 1024]
+
+          for n in sizes:
+
+              print("\nGraph size:", n)
+
+              G = make_graph(n, SEED + n)
+
+              source = 0
+              target = n - 1
+
+              baseline = global_recompute(
+                  G, source, target
+              )
+
+              old_path = baseline["path"]
+
+              if len(old_path) < 2:
+                  continue
+
+              # Change terrain on a genuine trail edge.
+              mid = max(
+                  0,
+                  len(old_path) // 2 - 1
+              )
+
+              u = old_path[mid]
+              v = old_path[mid + 1]
+
+              old_weight = G[u][v]["weight"]
+
+              G[u][v]["weight"] *= 8.0
+
+              full = global_recompute(
+                  G, source, target
+              )
+
+              repair = adaptive_repair(
+                  G,
+                  old_path,
+                  source,
+                  target,
+                  {u, v},
+                  full["cost"],
+                  epsilon=0.05
+              )
+
+              if repair["success"]:
+                  ratio = (
+                      repair["cost"]
+                      / full["cost"]
+                  )
+
+                  recompute_fraction = (
+                      repair["frontier_size"]
+                      / n
+                  )
+
+                  reduction = (
+                      1 - recompute_fraction
+                  ) * 100
+
+                  print(
+                      "global cost:",
+                      full["cost"]
+                  )
+
+                  print(
+                      "T3 cost:",
+                      repair["cost"]
+                  )
+
+                  print(
+                      "quality ratio:",
+                      ratio
+                  )
+
+                  print(
+                      "repair frontier:",
+                      repair["frontier_size"],
+                      "/",
+                      n
+                  )
+
+                  print(
+                      "state-space reduction:",
+                      reduction,
+                      "%"
+                  )
+
+                  records.append({
+                      "experiment":
+                          "adaptive_graph_repair",
+                      "nodes": n,
+                      "global_cost":
+                          full["cost"],
+                      "t3_cost":
+                          repair["cost"],
+                      "quality_ratio":
+                          ratio,
+                      "frontier_size":
+                          repair["frontier_size"],
+                      "recompute_fraction":
+                          recompute_fraction,
+                      "reduction_pct":
+                          reduction,
+                      "changed_edges":
+                          repair["changed_edges"],
+                      "radius":
+                          repair["radius"],
+                      "global_runtime":
+                          full["runtime"],
+                      "t3_runtime":
+                          repair["runtime"]
+                  })
+
+
+          # ------------------------------------------------------------
+          # E5: Monte Carlo perturbation benchmark
+          # ------------------------------------------------------------
+
+          print("\nE5: MONTE CARLO TERRAIN PERTURBATIONS")
+
+          trials = 50 if not PREMIUM else 250
+
+          successes = 0
+          reductions = []
+          quality = []
+
+          G = make_graph(
+              256 if not PREMIUM else 512,
+              999
+          )
+
+          source = 0
+          target = len(G) - 1
+
+          for trial in range(trials):
+
+              base = global_recompute(
+                  G,
+                  source,
+                  target
+              )
+
+              path = base["path"]
+
+              if len(path) < 2:
+                  continue
+
+              idx = random.randrange(
+                  len(path) - 1
+              )
+
+              u, v = path[idx], path[idx + 1]
+
+              old = G[u][v]["weight"]
+
+              factor = random.uniform(
+                  1.5,
+                  8.0
+              )
+
+              G[u][v]["weight"] = (
+                  old * factor
+              )
+
+              full = global_recompute(
+                  G,
+                  source,
+                  target
+              )
+
+              repair = adaptive_repair(
+                  G,
+                  path,
+                  source,
+                  target,
+                  {u, v},
+                  full["cost"],
+                  epsilon=0.05
+              )
+
+              if repair["success"]:
+                  successes += 1
+
+                  reductions.append(
+                      1 -
+                      repair["frontier_size"]
+                      / len(G)
+                  )
+
+                  quality.append(
+                      repair["cost"]
+                      / full["cost"]
+                  )
+
+              # Restore Terrain.
+              G[u][v]["weight"] = old
+
+          success_rate = (
+              successes / trials
+              if trials
+              else 0
+          )
+
+          mean_reduction = (
+              np.mean(reductions)
+              if reductions
+              else 0
+          )
+
+          mean_quality = (
+              np.mean(quality)
+              if quality
+              else np.nan
+          )
+
+          print(
+              "Trials:",
+              trials
+          )
+
+          print(
+              "Successful local repairs:",
+              successes
+          )
+
+          print(
+              "Success rate:",
+              success_rate
+          )
+
+          print(
+              "Mean recomputation reduction:",
+              mean_reduction
+          )
+
+          print(
+              "Mean quality ratio:",
+              mean_quality
+          )
+
+          records.append({
+              "experiment":
+                  "monte_carlo",
+              "nodes":
+                  len(G),
+              "trials":
+                  trials,
+              "success_rate":
+                  success_rate,
+              "reduction_pct":
+                  mean_reduction * 100,
+              "quality_ratio":
+                  mean_quality
+          })
+
+
+          # ------------------------------------------------------------
+          # E6: IBM Quantum connection
+          # ------------------------------------------------------------
+
+          token = os.getenv(
+              "IBM_QUANTUM_TOKEN", ""
+          ).strip()
+
+          instance = os.getenv(
+              "IBM_QUANTUM_INSTANCE", ""
+          ).strip()
+
+          quantum = {
+              "enabled": RUN_QPU,
+              "premium": PREMIUM
+          }
+
+          if RUN_QPU and token:
+
+              print("\nE6: IBM QUANTUM HARDWARE")
+
+              kwargs = {
+                  "channel":
+                      "ibm_quantum_platform",
+                  "token":
+                      token
+              }
+
+              if instance:
+                  kwargs["instance"] = instance
+
+              service = QiskitRuntimeService(
+                  **kwargs
+              )
+
+              backend = service.least_busy(
+                  operational=True,
+                  simulator=False,
+                  min_num_qubits=5
+              )
+
+              print(
+                  "Selected:",
+                  backend.name,
+                  backend.num_qubits,
+                  "qubits"
+              )
+
+              quantum["backend"] = backend.name
+              quantum["qubits"] = backend.num_qubits
+
+
+              # --------------------------------------------------------
+              # E7: Hardware GHZ / SamplerV2 control
+              # --------------------------------------------------------
+
+              qc = QuantumCircuit(5)
+
+              qc.h(0)
+
+              for i in range(4):
+                  qc.cx(i, i + 1)
+
+              qc.measure_all()
+
+              pm = generate_preset_pass_manager(
+                  backend=backend,
+                  optimization_level=3
+              )
+
+              isa_qc = pm.run(qc)
+
+              sampler = SamplerV2(
+                  mode=backend
+              )
+
+              # DD + twirling = higher-quality hardware control.
+              sampler.options.dynamical_decoupling.enable = True
+              sampler.options.dynamical_decoupling.sequence_type = "XpXm"
+
+              sampler.options.twirling.enable_gates = True
+
+              if PREMIUM:
+                  sampler.options.twirling.num_randomizations = 64
+                  sampler.options.twirling.shots_per_randomization = max(
+                      64,
+                      SHOTS // 64
+                  )
+
+              print(
+                  "Submitting SamplerV2 hardware control..."
+              )
+
+              sjob = sampler.run(
+                  [isa_qc],
+                  shots=SHOTS
+              )
+
+              print(
+                  "Sampler job:",
+                  sjob.job_id()
+              )
+
+              sresult = sjob.result()[0]
+
+              counts = (
+                  sresult.data.meas.get_counts()
+              )
+
+              good = (
+                  counts.get("00000", 0)
+                  + counts.get("11111", 0)
+              )
+
+              fidelity_proxy = (
+                  good / SHOTS
+              )
+
+              print(
+                  "GHZ success:",
+                  fidelity_proxy
+              )
+
+              quantum[
+                  "sampler_job"
+              ] = sjob.job_id()
+
+              quantum[
+                  "ghz_success"
+              ] = fidelity_proxy
+
+
+              # --------------------------------------------------------
+              # E8: EstimatorV2 + advanced resilience
+              # --------------------------------------------------------
+
+              print(
+                  "\nE8: ESTIMATOR V2 RESILIENCE BENCHMARK"
+              )
+
+              qce = QuantumCircuit(5)
+
+              qce.h(0)
+
+              for i in range(4):
+                  qce.cx(i, i + 1)
+
+              isa_est = pm.run(qce)
+
+              observable = SparsePauliOp(
+                  "ZZZZZ"
+              )
+
+              observable = (
+                  observable.apply_layout(
+                      isa_est.layout
+                  )
+              )
+
+              estimator = EstimatorV2(
+                  mode=backend
+              )
+
+              estimator.options.default_shots = SHOTS
+
+              estimator.options.dynamical_decoupling.enable = True
+              estimator.options.dynamical_decoupling.sequence_type = "XpXm"
+
+              estimator.options.twirling.enable_gates = True
+
+              if PREMIUM:
+
+                  # IBM's advanced TREX + ZNE stack.
+                  estimator.options.resilience_level = 2
+
+                  estimator.options.resilience.zne_mitigation = True
+
+                  estimator.options.resilience.zne.noise_factors = (
+                      1,
+                      3,
+                      5
+                  )
+
+                  estimator.options.resilience.zne.extrapolator = (
+                      "exponential",
+                      "linear"
+                  )
+
+              else:
+
+                  estimator.options.resilience_level = 1
+
+              print(
+                  "Submitting EstimatorV2..."
+              )
+
+              ejob = estimator.run([
+                  (
+                      isa_est,
+                      observable
+                  )
+              ])
+
+              print(
+                  "Estimator job:",
+                  ejob.job_id()
+              )
+
+              eresult = ejob.result()[0]
+
+              ev = np.asarray(
+                  eresult.data.evs
+              ).tolist()
+
+              std = np.asarray(
+                  eresult.data.stds
+              ).tolist()
+
+              print(
+                  "Expectation:",
+                  ev
+              )
+
+              quantum[
+                  "estimator_job"
+              ] = ejob.job_id()
+
+              quantum[
+                  "expectation"
+              ] = ev
+
+              quantum[
+                  "std"
+              ] = std
+
+
+          elif RUN_QPU:
+              print(
+                  "QPU requested but IBM token unavailable."
+              )
+
+          else:
+              print(
+                  "\nIBM hardware execution disabled."
+              )
+
+
+          # ------------------------------------------------------------
+          # E9: T3 hypothesis score
+          # ------------------------------------------------------------
+
+          print("\nE9: T3 V5 HYPOTHESIS")
+
+          # Strong criterion:
+          # 1. >= 90% perturbations repaired
+          # 2. <= 5% optimality loss
+          # 3. >= 50% of topology left untouched
+
+          hypothesis = (
+              success_rate >= 0.90
+              and
+              (
+                  np.isnan(mean_quality)
+                  or mean_quality <= 1.05
+              )
+              and
+              mean_reduction >= 0.50
+          )
+
+          print(
+              "Repair success >=90%:",
+              success_rate >= 0.90
+          )
+
+          print(
+              "Mean quality <=1.05x optimum:",
+              (
+                  not np.isnan(mean_quality)
+                  and mean_quality <= 1.05
+              )
+          )
+
+          print(
+              "Mean reduction >=50%:",
+              mean_reduction >= 0.50
+          )
+
+          print(
+              "V5 hypothesis supported:",
+              hypothesis
+          )
+
+
+          # ------------------------------------------------------------
+          # Export
+          # ------------------------------------------------------------
+
+          raw["quantum"] = quantum
+
+          raw["summary"] = {
+              "success_rate":
+                  success_rate,
+              "mean_reduction":
+                  mean_reduction,
+              "mean_quality_ratio":
+                  mean_quality,
+              "hypothesis_supported":
+                  hypothesis
+          }
+
+          df = pd.DataFrame(records)
+
+          df.to_csv(
+              "t3_v5_benchmark.csv",
+              index=False
+          )
+
+          with open(
+              "t3_v5_benchmark.json",
+              "w"
+          ) as f:
+              json.dump(
+                  raw,
+                  f,
+                  indent=2,
+                  default=str
+              )
+
+          print("\nFINAL RESULTS")
+          print(df.to_string(index=False))
+
+          print(
+              "\nT3 V5 hypothesis:",
+              hypothesis
+          )
+
+          PY
+
+          python /tmp/t3_v5.py
+
+      - name: Upload V5 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-v5-premium-results
+          path: |
+            t3_v5_benchmark.csv
+            t3_v5_benchmark.json
+          if-no-files-found: warn
