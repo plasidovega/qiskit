@@ -1,0 +1,1250 @@
+name: QGSS 2026 T3 Benchmark V4 - Adaptive Repair
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/v4.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  adaptive-t3-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
+      IBM_QUANTUM_INSTANCE: ${{ secrets.IBM_QUANTUM_INSTANCE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            qiskit \
+            qiskit-aer \
+            qiskit-ibm-runtime \
+            numpy \
+            pandas
+
+      - name: Run T3 V4 adaptive-repair benchmark
+        shell: bash
+        run: |
+          cat > /tmp/t3_v4.py <<'PY'
+          import itertools
+          import json
+          import os
+          import time
+
+          import numpy as np
+          import pandas as pd
+
+          from qiskit import QuantumCircuit
+          from qiskit_aer import AerSimulator
+          from qiskit_ibm_runtime import (
+              QiskitRuntimeService,
+              SamplerV2 as RuntimeSampler,
+          )
+
+
+          # ============================================================
+          # Configuration
+          # ============================================================
+
+          BASELINE = [3, 5, 7, 9, 11, 13]
+
+          # Same disruptive Terrain change discovered in V3.
+          CHANGED = [1, 5, 7, 9, 11, 13]
+          CHANGED_INDEX = 0
+
+          # Accept exact global quality by default.
+          EPSILON = 0
+
+          # Trail disruption weight.
+          LAMBDA_CHANGE = 1.0
+
+          # Real QPU control experiment.
+          QPU_SHOTS = 256
+
+          results = []
+          raw = {}
+
+
+          # ============================================================
+          # Partition utilities
+          # ============================================================
+
+          def canonical(bits):
+              """
+              Partition and its complement represent the same partition.
+              Canonicalize by requiring bit 0 == 0.
+              """
+              bits = tuple(int(x) for x in bits)
+
+              if bits[0] == 0:
+                  return bits
+
+              return tuple(1 - x for x in bits)
+
+
+          def imbalance(numbers, bits):
+              left = sum(
+                  n for n, b in zip(numbers, bits)
+                  if b == 0
+              )
+
+              right = sum(
+                  n for n, b in zip(numbers, bits)
+                  if b == 1
+              )
+
+              return abs(left - right)
+
+
+          def partition_values(numbers, bits):
+              left = [
+                  n for n, b in zip(numbers, bits)
+                  if b == 0
+              ]
+
+              right = [
+                  n for n, b in zip(numbers, bits)
+                  if b == 1
+              ]
+
+              return left, right
+
+
+          def assignment_distance(a, b):
+              a = canonical(a)
+              b = canonical(b)
+
+              return sum(
+                  x != y
+                  for x, y in zip(a, b)
+              )
+
+
+          # ============================================================
+          # Exact global solver
+          # ============================================================
+
+          def exact_partition(numbers):
+              """
+              Exhaustive reference solver.
+
+              Complement symmetry is removed by forcing the first
+              assignment bit to zero.
+              """
+
+              n = len(numbers)
+
+              best_bits = None
+              best_imbalance = float("inf")
+
+              explored = 0
+
+              start = time.perf_counter()
+
+              for tail in itertools.product(
+                  [0, 1],
+                  repeat=n - 1
+              ):
+                  bits = (0,) + tail
+
+                  explored += 1
+
+                  score = imbalance(
+                      numbers,
+                      bits
+                  )
+
+                  if score < best_imbalance:
+                      best_imbalance = score
+                      best_bits = bits
+
+              elapsed = time.perf_counter() - start
+
+              return {
+                  "bits": canonical(best_bits),
+                  "imbalance": int(best_imbalance),
+                  "explored": explored,
+                  "runtime_sec": elapsed,
+              }
+
+
+          # ============================================================
+          # Adaptive T3 repair
+          # ============================================================
+
+          def repair_frontier(
+              numbers,
+              previous_bits,
+              changed_index,
+              target_imbalance,
+              epsilon=0,
+          ):
+              """
+              Adaptive T3 repair.
+
+              Start with the changed variable and progressively enlarge
+              the repair frontier.
+
+              For this V4 benchmark, locality is still represented by
+              index distance.
+
+              This deliberately isolates the adaptive-frontier concept.
+              V5 can replace index distance with true graph-neighbourhood
+              expansion.
+              """
+
+              n = len(numbers)
+
+              previous_bits = canonical(
+                  previous_bits
+              )
+
+              all_evaluated = 0
+              history = []
+
+              overall_start = time.perf_counter()
+
+              for radius in range(n):
+
+                  lo = max(
+                      0,
+                      changed_index - radius
+                  )
+
+                  hi = min(
+                      n - 1,
+                      changed_index + radius
+                  )
+
+                  frontier = list(
+                      range(lo, hi + 1)
+                  )
+
+                  # If bit 0 is inside the frontier, keep it fixed at
+                  # zero to remove complement symmetry.
+                  variable_frontier = [
+                      i for i in frontier
+                      if i != 0
+                  ]
+
+                  best_bits = None
+                  best_quality = float("inf")
+                  best_changes = float("inf")
+                  best_score = float("inf")
+
+                  radius_explored = 0
+
+                  radius_start = time.perf_counter()
+
+                  for values in itertools.product(
+                      [0, 1],
+                      repeat=len(variable_frontier)
+                  ):
+
+                      candidate = list(
+                          previous_bits
+                      )
+
+                      for idx, value in zip(
+                          variable_frontier,
+                          values
+                      ):
+                          candidate[idx] = value
+
+                      candidate[0] = 0
+                      candidate = canonical(candidate)
+
+                      radius_explored += 1
+                      all_evaluated += 1
+
+                      quality = imbalance(
+                          numbers,
+                          candidate
+                      )
+
+                      changes = assignment_distance(
+                          previous_bits,
+                          candidate
+                      )
+
+                      disruption_score = (
+                          quality
+                          + LAMBDA_CHANGE * changes
+                      )
+
+                      key = (
+                          quality,
+                          changes,
+                          disruption_score
+                      )
+
+                      best_key = (
+                          best_quality,
+                          best_changes,
+                          best_score
+                      )
+
+                      if key < best_key:
+                          best_bits = candidate
+                          best_quality = quality
+                          best_changes = changes
+                          best_score = disruption_score
+
+                  radius_runtime = (
+                      time.perf_counter()
+                      - radius_start
+                  )
+
+                  history.append({
+                      "radius": radius,
+                      "frontier": frontier,
+                      "frontier_size": len(frontier),
+                      "variable_frontier_size":
+                          len(variable_frontier),
+                      "radius_states":
+                          radius_explored,
+                      "cumulative_states":
+                          all_evaluated,
+                      "best_imbalance":
+                          int(best_quality),
+                      "changed_assignments":
+                          int(best_changes),
+                      "disruption_score":
+                          float(best_score),
+                      "runtime_sec":
+                          radius_runtime,
+                  })
+
+                  # Stop at the smallest frontier satisfying
+                  # the quality invariant.
+                  if (
+                      best_quality
+                      <= target_imbalance + epsilon
+                  ):
+                      total_runtime = (
+                          time.perf_counter()
+                          - overall_start
+                      )
+
+                      return {
+                          "bits":
+                              canonical(best_bits),
+                          "imbalance":
+                              int(best_quality),
+                          "changed_assignments":
+                              int(best_changes),
+                          "radius":
+                              radius,
+                          "frontier":
+                              frontier,
+                          "frontier_size":
+                              len(frontier),
+                          "explored":
+                              all_evaluated,
+                          "runtime_sec":
+                              total_runtime,
+                          "history":
+                              history,
+                          "matched_target":
+                              True,
+                      }
+
+              total_runtime = (
+                  time.perf_counter()
+                  - overall_start
+              )
+
+              final = history[-1]
+
+              return {
+                  "bits":
+                      canonical(best_bits),
+                  "imbalance":
+                      int(best_quality),
+                  "changed_assignments":
+                      int(best_changes),
+                  "radius":
+                      final["radius"],
+                  "frontier":
+                      final["frontier"],
+                  "frontier_size":
+                      final["frontier_size"],
+                  "explored":
+                      all_evaluated,
+                  "runtime_sec":
+                      total_runtime,
+                  "history":
+                      history,
+                  "matched_target":
+                      False,
+              }
+
+
+          # ============================================================
+          # E1 — Baseline
+          # ============================================================
+
+          print("\n=== E1: BASELINE EXACT SOLUTION ===")
+
+          baseline = exact_partition(BASELINE)
+
+          baseline_left, baseline_right = (
+              partition_values(
+                  BASELINE,
+                  baseline["bits"]
+              )
+          )
+
+          print(
+              "Baseline:",
+              BASELINE
+          )
+
+          print(
+              "Bits:",
+              baseline["bits"]
+          )
+
+          print(
+              "Partition:",
+              baseline_left,
+              "vs",
+              baseline_right
+          )
+
+          print(
+              "Imbalance:",
+              baseline["imbalance"]
+          )
+
+          print(
+              "Canonical exact states:",
+              baseline["explored"]
+          )
+
+          raw["baseline"] = baseline
+
+
+          # ============================================================
+          # E2 — Same disruptive Terrain perturbation as V3
+          # ============================================================
+
+          print(
+              "\n=== E2: DISRUPTIVE TERRAIN CHANGE ==="
+          )
+
+          changed_exact = exact_partition(
+              CHANGED
+          )
+
+          exact_changes = assignment_distance(
+              baseline["bits"],
+              changed_exact["bits"]
+          )
+
+          print(
+              "Terrain:",
+              BASELINE,
+              "->",
+              CHANGED
+          )
+
+          print(
+              "Changed element:",
+              BASELINE[CHANGED_INDEX],
+              "->",
+              CHANGED[CHANGED_INDEX]
+          )
+
+          print(
+              "New exact bits:",
+              changed_exact["bits"]
+          )
+
+          print(
+              "Global optimum imbalance:",
+              changed_exact["imbalance"]
+          )
+
+          print(
+              "Global assignment changes:",
+              exact_changes
+          )
+
+          raw["changed_exact"] = changed_exact
+
+
+          # ============================================================
+          # E3 — Adaptive repair frontier
+          # ============================================================
+
+          print(
+              "\n=== E3: ADAPTIVE T3 REPAIR ==="
+          )
+
+          adaptive = repair_frontier(
+              CHANGED,
+              baseline["bits"],
+              CHANGED_INDEX,
+              changed_exact["imbalance"],
+              EPSILON,
+          )
+
+          print(
+              "\nRepair curve:"
+          )
+
+          for h in adaptive["history"]:
+              print(
+                  "radius=",
+                  h["radius"],
+                  "frontier=",
+                  h["frontier"],
+                  "states=",
+                  h["radius_states"],
+                  "cumulative=",
+                  h["cumulative_states"],
+                  "imbalance=",
+                  h["best_imbalance"],
+                  "changes=",
+                  h["changed_assignments"],
+              )
+
+          print(
+              "\nSelected radius:",
+              adaptive["radius"]
+          )
+
+          print(
+              "Selected frontier:",
+              adaptive["frontier"]
+          )
+
+          print(
+              "T3 imbalance:",
+              adaptive["imbalance"]
+          )
+
+          print(
+              "T3 changed assignments:",
+              adaptive[
+                  "changed_assignments"
+              ]
+          )
+
+          print(
+              "T3 cumulative states:",
+              adaptive["explored"]
+          )
+
+          raw["adaptive"] = adaptive
+
+
+          # ============================================================
+          # E4 — V3 vs V4 comparison
+          # ============================================================
+
+          print(
+              "\n=== E4: V3 FIXED LOCALITY VS V4 ADAPTIVE ==="
+          )
+
+          # Reproduce V3 radius-1 behaviour.
+          def fixed_radius_one(
+              numbers,
+              previous_bits,
+              changed_index
+          ):
+              n = len(numbers)
+
+              frontier = list(
+                  range(
+                      max(0, changed_index - 1),
+                      min(
+                          n - 1,
+                          changed_index + 1
+                      ) + 1
+                  )
+              )
+
+              variable_frontier = [
+                  i for i in frontier
+                  if i != 0
+              ]
+
+              best = None
+              best_key = None
+              explored = 0
+
+              for values in itertools.product(
+                  [0, 1],
+                  repeat=len(variable_frontier)
+              ):
+                  candidate = list(
+                      canonical(previous_bits)
+                  )
+
+                  for idx, value in zip(
+                      variable_frontier,
+                      values
+                  ):
+                      candidate[idx] = value
+
+                  candidate[0] = 0
+                  candidate = canonical(candidate)
+
+                  explored += 1
+
+                  q = imbalance(
+                      numbers,
+                      candidate
+                  )
+
+                  c = assignment_distance(
+                      previous_bits,
+                      candidate
+                  )
+
+                  key = (
+                      q,
+                      c
+                  )
+
+                  if (
+                      best_key is None
+                      or key < best_key
+                  ):
+                      best_key = key
+                      best = candidate
+
+              return {
+                  "bits": best,
+                  "imbalance":
+                      int(best_key[0]),
+                  "changed_assignments":
+                      int(best_key[1]),
+                  "explored":
+                      explored,
+                  "frontier":
+                      frontier,
+              }
+
+
+          fixed = fixed_radius_one(
+              CHANGED,
+              baseline["bits"],
+              CHANGED_INDEX
+          )
+
+          canonical_full_states = (
+              changed_exact["explored"]
+          )
+
+          adaptive_reduction = (
+              1
+              - adaptive["explored"]
+              / canonical_full_states
+          ) * 100
+
+          print(
+              "V3-style fixed repair imbalance:",
+              fixed["imbalance"]
+          )
+
+          print(
+              "V3-style states:",
+              fixed["explored"]
+          )
+
+          print(
+              "V4 adaptive imbalance:",
+              adaptive["imbalance"]
+          )
+
+          print(
+              "V4 cumulative states:",
+              adaptive["explored"]
+          )
+
+          print(
+              "Canonical exhaustive states:",
+              canonical_full_states
+          )
+
+          print(
+              "V4 search reduction vs exact:",
+              round(
+                  adaptive_reduction,
+                  2
+              ),
+              "%"
+          )
+
+
+          # ============================================================
+          # E5 — Sequential Terrain changes
+          # ============================================================
+
+          print(
+              "\n=== E5: SEQUENTIAL TERRAIN CHANGES ==="
+          )
+
+          sequential_cases = [
+              [2, 5, 7, 9, 11, 13],
+              [4, 5, 7, 9, 11, 13],
+              [1, 5, 7, 9, 11, 13],
+              [3, 5, 7, 9, 11, 13],
+          ]
+
+          current_bits = baseline["bits"]
+
+          sequential_results = []
+
+          for case_number, numbers in enumerate(
+              sequential_cases,
+              start=1
+          ):
+
+              full = exact_partition(
+                  numbers
+              )
+
+              repair = repair_frontier(
+                  numbers,
+                  current_bits,
+                  CHANGED_INDEX,
+                  full["imbalance"],
+                  EPSILON,
+              )
+
+              reduction = (
+                  1
+                  - repair["explored"]
+                  / full["explored"]
+              ) * 100
+
+              row = {
+                  "case":
+                      case_number,
+                  "numbers":
+                      numbers,
+                  "global_imbalance":
+                      full["imbalance"],
+                  "t3_imbalance":
+                      repair["imbalance"],
+                  "radius":
+                      repair["radius"],
+                  "frontier_size":
+                      repair["frontier_size"],
+                  "t3_states":
+                      repair["explored"],
+                  "full_states":
+                      full["explored"],
+                  "search_reduction_pct":
+                      reduction,
+                  "changed_assignments":
+                      repair[
+                          "changed_assignments"
+                      ],
+                  "quality_matched":
+                      (
+                          repair["imbalance"]
+                          <= full["imbalance"]
+                          + EPSILON
+                      ),
+              }
+
+              sequential_results.append(
+                  row
+              )
+
+              print(
+                  "Case",
+                  case_number,
+                  numbers,
+                  "| global=",
+                  full["imbalance"],
+                  "| T3=",
+                  repair["imbalance"],
+                  "| radius=",
+                  repair["radius"],
+                  "| states=",
+                  repair["explored"],
+                  "/",
+                  full["explored"],
+                  "| reduction=",
+                  round(reduction, 2),
+                  "%"
+              )
+
+              current_bits = repair["bits"]
+
+          raw[
+              "sequential_results"
+          ] = sequential_results
+
+
+          # ============================================================
+          # E6 — Aer GHZ control
+          # ============================================================
+
+          print(
+              "\n=== E6: AER GHZ CONTROL ==="
+          )
+
+          ghz = QuantumCircuit(3)
+
+          ghz.h(0)
+          ghz.cx(0, 1)
+          ghz.cx(1, 2)
+          ghz.measure_all()
+
+          aer = AerSimulator()
+
+          aer_counts = (
+              aer.run(
+                  ghz,
+                  shots=1024
+              )
+              .result()
+              .get_counts()
+          )
+
+          print(
+              "Aer GHZ counts:",
+              aer_counts
+          )
+
+          raw[
+              "aer_ghz_counts"
+          ] = aer_counts
+
+
+          # ============================================================
+          # E7 — IBM Quantum backend discovery
+          # ============================================================
+
+          print(
+              "\n=== E7: IBM QUANTUM BACKENDS ==="
+          )
+
+          token = os.environ.get(
+              "IBM_QUANTUM_TOKEN",
+              ""
+          ).strip()
+
+          instance = os.environ.get(
+              "IBM_QUANTUM_INSTANCE",
+              ""
+          ).strip()
+
+          qpu_summary = {
+              "attempted": False,
+              "success": False,
+          }
+
+          if not token:
+              print(
+                  "IBM_QUANTUM_TOKEN unavailable; "
+                  "skipping real QPU control."
+              )
+
+          else:
+              try:
+                  kwargs = {
+                      "channel":
+                          "ibm_quantum_platform",
+                      "token":
+                          token,
+                  }
+
+                  if instance:
+                      kwargs[
+                          "instance"
+                      ] = instance
+
+                  service = (
+                      QiskitRuntimeService(
+                          **kwargs
+                      )
+                  )
+
+                  backends = (
+                      service.backends(
+                          operational=True,
+                          simulator=False,
+                      )
+                  )
+
+                  print(
+                      "Accessible real backends:",
+                      len(backends)
+                  )
+
+                  for backend in backends:
+                      print(
+                          "-",
+                          backend.name,
+                          backend.num_qubits,
+                          "qubits"
+                      )
+
+                  eligible = [
+                      b for b in backends
+                      if b.num_qubits >= 3
+                  ]
+
+                  if not eligible:
+                      raise RuntimeError(
+                          "No eligible >=3-qubit "
+                          "real backend."
+                      )
+
+                  # Prefer least pending jobs where available.
+                  def pending_jobs(b):
+                      try:
+                          return (
+                              b.status()
+                              .pending_jobs
+                          )
+                      except Exception:
+                          return 10**9
+
+                  backend = min(
+                      eligible,
+                      key=pending_jobs
+                  )
+
+                  print(
+                      "Selected backend:",
+                      backend.name
+                  )
+
+                  qpu_summary[
+                      "attempted"
+                  ] = True
+
+                  isa_ghz = (
+                      backend
+                      .target
+                  )
+
+                  from qiskit.transpiler import (
+                      generate_preset_pass_manager
+                  )
+
+                  pm = (
+                      generate_preset_pass_manager(
+                          backend=backend,
+                          optimization_level=1,
+                      )
+                  )
+
+                  isa_circuit = pm.run(
+                      ghz
+                  )
+
+                  sampler = RuntimeSampler(
+                      mode=backend
+                  )
+
+                  job = sampler.run(
+                      [isa_circuit],
+                      shots=QPU_SHOTS
+                  )
+
+                  print(
+                      "IBM job ID:",
+                      job.job_id()
+                  )
+
+                  qpu_result = (
+                      job.result()[0]
+                  )
+
+                  counts = (
+                      qpu_result
+                      .data
+                      .meas
+                      .get_counts()
+                  )
+
+                  success_shots = (
+                      counts.get("000", 0)
+                      + counts.get("111", 0)
+                  )
+
+                  success_fraction = (
+                      success_shots
+                      / QPU_SHOTS
+                  )
+
+                  print(
+                      "Real QPU counts:",
+                      counts
+                  )
+
+                  print(
+                      "GHZ success fraction:",
+                      success_fraction
+                  )
+
+                  qpu_summary.update({
+                      "success": True,
+                      "backend":
+                          backend.name,
+                      "num_qubits":
+                          backend.num_qubits,
+                      "job_id":
+                          job.job_id(),
+                      "shots":
+                          QPU_SHOTS,
+                      "counts":
+                          counts,
+                      "ghz_success_fraction":
+                          success_fraction,
+                  })
+
+              except Exception as exc:
+                  print(
+                      "QPU control failed:",
+                      repr(exc)
+                  )
+
+                  qpu_summary[
+                      "error"
+                  ] = repr(exc)
+
+          raw[
+              "qpu"
+          ] = qpu_summary
+
+
+          # ============================================================
+          # E8 — Core V4 hypothesis
+          # ============================================================
+
+          print(
+              "\n=== E8: V4 HYPOTHESIS TEST ==="
+          )
+
+          quality_preserved = (
+              adaptive["imbalance"]
+              <= changed_exact["imbalance"]
+              + EPSILON
+          )
+
+          less_than_global_search = (
+              adaptive["explored"]
+              < changed_exact["explored"]
+          )
+
+          adaptive_expansion_used = (
+              adaptive["radius"] > 1
+          )
+
+          hypothesis_supported = (
+              quality_preserved
+              and less_than_global_search
+          )
+
+          print(
+              "Quality preserved:",
+              quality_preserved
+          )
+
+          print(
+              "Adaptive expansion required:",
+              adaptive_expansion_used
+          )
+
+          print(
+              "Less search than exhaustive:",
+              less_than_global_search
+          )
+
+          print(
+              "V4 operational hypothesis supported:",
+              hypothesis_supported
+          )
+
+          print(
+              "\nIMPORTANT:"
+          )
+
+          print(
+              "This is evidence for this benchmark instance, "
+              "not proof of the general T3 hypothesis."
+          )
+
+
+          # ============================================================
+          # Export results
+          # ============================================================
+
+          results.append({
+              "experiment":
+                  "V4 disruptive terrain repair",
+              "baseline_numbers":
+                  str(BASELINE),
+              "changed_numbers":
+                  str(CHANGED),
+              "global_imbalance":
+                  changed_exact[
+                      "imbalance"
+                  ],
+              "global_changed_assignments":
+                  exact_changes,
+              "global_states":
+                  changed_exact[
+                      "explored"
+                  ],
+              "v3_fixed_imbalance":
+                  fixed[
+                      "imbalance"
+                  ],
+              "v3_fixed_states":
+                  fixed[
+                      "explored"
+                  ],
+              "v4_imbalance":
+                  adaptive[
+                      "imbalance"
+                  ],
+              "v4_changed_assignments":
+                  adaptive[
+                      "changed_assignments"
+                  ],
+              "v4_radius":
+                  adaptive[
+                      "radius"
+                  ],
+              "v4_frontier_size":
+                  adaptive[
+                      "frontier_size"
+                  ],
+              "v4_states":
+                  adaptive[
+                      "explored"
+                  ],
+              "search_reduction_pct":
+                  adaptive_reduction,
+              "quality_preserved":
+                  quality_preserved,
+              "hypothesis_supported":
+                  hypothesis_supported,
+          })
+
+          df = pd.DataFrame(
+              results
+          )
+
+          df.to_csv(
+              "qgss_t3_v4_results.csv",
+              index=False
+          )
+
+          raw["summary"] = results[0]
+
+          with open(
+              "qgss_t3_v4_results.json",
+              "w"
+          ) as f:
+              json.dump(
+                  raw,
+                  f,
+                  indent=2,
+                  default=str
+              )
+
+          with open(
+              "qgss_t3_v4_repair_curve.json",
+              "w"
+          ) as f:
+              json.dump(
+                  adaptive["history"],
+                  f,
+                  indent=2,
+                  default=str
+              )
+
+          pd.DataFrame(
+              adaptive["history"]
+          ).to_csv(
+              "qgss_t3_v4_repair_curve.csv",
+              index=False
+          )
+
+          pd.DataFrame(
+              sequential_results
+          ).to_csv(
+              "qgss_t3_v4_sequential.csv",
+              index=False
+          )
+
+          print(
+              "\n=== FINAL V4 SUMMARY ==="
+          )
+
+          print(
+              df.to_string(
+                  index=False
+              )
+          )
+
+          print(
+              "\nArtifacts generated:"
+          )
+
+          print(
+              "- qgss_t3_v4_results.csv"
+          )
+
+          print(
+              "- qgss_t3_v4_results.json"
+          )
+
+          print(
+              "- qgss_t3_v4_repair_curve.csv"
+          )
+
+          print(
+              "- qgss_t3_v4_repair_curve.json"
+          )
+
+          print(
+              "- qgss_t3_v4_sequential.csv"
+          )
+
+          PY
+
+          python /tmp/t3_v4.py
+
+      - name: Upload V4 benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qgss-t3-v4-results
+          path: |
+            qgss_t3_v4_results.csv
+            qgss_t3_v4_results.json
+            qgss_t3_v4_repair_curve.csv
+            qgss_t3_v4_repair_curve.json
+            qgss_t3_v4_sequential.csv
+          if-no-files-found: warn
