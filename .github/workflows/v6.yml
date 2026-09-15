@@ -1,4 +1,4 @@
-name: T3 Benchmark V6 - Qiskit Maximum Capability
+name: T3 Benchmark V6 - Robust Qiskit Capability
 
 on:
   push:
@@ -6,13 +6,6 @@ on:
     paths:
       - ".github/workflows/v6.yml"
   workflow_dispatch:
-    inputs:
-      enable_pec:
-        description: "Enable bounded PEC experiment"
-        required: true
-        default: "false"
-        type: choice
-        options: ["false", "true"]
 
 permissions:
   contents: read
@@ -20,176 +13,192 @@ permissions:
 jobs:
   t3-v6:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 45
 
     env:
       IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
       IBM_QUANTUM_INSTANCE: ${{ secrets.IBM_QUANTUM_INSTANCE }}
-      ENABLE_PEC: ${{ inputs.enable_pec || 'false' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Qiskit research stack
+      - name: Install research stack
         run: |
           python -m pip install --upgrade pip
           pip install \
-            "qiskit[all]>=2.5.2" \
-            "qiskit-ibm-runtime>=0.47" \
+            qiskit \
             qiskit-aer \
-            qiskit-algorithms \
-            qiskit-optimization \
+            qiskit-ibm-runtime \
             networkx \
             numpy \
             scipy \
             pandas
 
-      - name: Run V6
+      - name: Run V6 benchmark
+        shell: bash
         run: |
+          set -euo pipefail
+
           cat > /tmp/v6.py <<'PY'
           import os
           import json
           import time
           import random
           import statistics
+          import platform
 
           import numpy as np
           import pandas as pd
           import networkx as nx
 
+          import qiskit
           from qiskit import QuantumCircuit
-          from qiskit.quantum_info import SparsePauliOp
           from qiskit.transpiler import generate_preset_pass_manager
           from qiskit_aer import AerSimulator
-          from qiskit_ibm_runtime import (
-              QiskitRuntimeService,
-              SamplerV2,
-              EstimatorV2
-          )
 
           SEED = 20260915
           random.seed(SEED)
           np.random.seed(SEED)
 
-          ENABLE_PEC = (
-              os.getenv("ENABLE_PEC", "false").lower() == "true"
-          )
-
           rows = []
-          raw = {}
+          report = {
+              "benchmark": "T3 V6",
+              "seed": SEED,
+              "python": platform.python_version(),
+              "qiskit": qiskit.__version__,
+              "t3": {},
+              "aer": [],
+              "ibm": {}
+          }
 
-          # ==========================================================
-          # T3 MODEL
-          # Terrain  = edge weights / failures / penalties
+
+          # ============================================================
+          # T3
+          # Terrain  = dynamic edge costs
           # Topology = graph
-          # Trail    = current source -> target solution
-          # ==========================================================
+          # Trail    = source-to-destination path
+          # ============================================================
 
           def make_graph(n, seed):
               rng = np.random.default_rng(seed)
 
               G = nx.connected_watts_strogatz_graph(
                   n=n,
-                  k=min(6, n - 1),
+                  k=6,
                   p=0.15,
                   seed=seed
               )
 
               for u, v in G.edges:
                   G[u][v]["weight"] = float(
-                      rng.uniform(1, 20)
+                      rng.uniform(1.0, 20.0)
                   )
 
               return G
 
 
-          def cost(G, path):
+          def path_cost(G, path):
               return sum(
                   G[u][v]["weight"]
                   for u, v in zip(path[:-1], path[1:])
               )
 
 
-          def solve_global(G, s, t):
+          def global_solution(G, source, target):
               start = time.perf_counter()
 
-              p = nx.shortest_path(
-                  G, s, t, weight="weight"
+              path = nx.shortest_path(
+                  G,
+                  source,
+                  target,
+                  weight="weight"
               )
 
-              return {
-                  "path": p,
-                  "cost": cost(G, p),
-                  "time": time.perf_counter() - start,
-                  "nodes_examined_proxy": len(G)
-              }
+              elapsed = time.perf_counter() - start
+
+              return path, path_cost(G, path), elapsed
 
 
-          def expand_frontier(G, initial, radius):
-              frontier = set(initial)
+          def frontier(G, seeds, radius):
+              nodes = set(seeds)
+              edge = set(seeds)
 
               for _ in range(radius):
-                  frontier |= {
-                      x
-                      for n in tuple(frontier)
-                      for x in G.neighbors(n)
-                  }
+                  nxt = set()
 
-              return frontier
+                  for u in edge:
+                      nxt.update(G.neighbors(u))
+
+                  nxt -= nodes
+                  nodes |= nxt
+                  edge = nxt
+
+                  if not edge:
+                      break
+
+              return nodes
 
 
-          def adaptive_t3(
+          def valid_path(G, path):
+              if len(path) != len(set(path)):
+                  return False
+
+              return all(
+                  G.has_edge(u, v)
+                  for u, v in zip(path[:-1], path[1:])
+              )
+
+
+          def adaptive_repair(
               G,
               old_path,
               changed_nodes,
-              global_cost,
-              epsilon=0.02
+              optimal_cost,
+              epsilon=0.02,
+              max_radius=8
           ):
               start = time.perf_counter()
-
-              max_radius = min(
-                  nx.diameter(G),
-                  12
-              )
-
-              curve = []
+              best = None
 
               for radius in range(max_radius + 1):
-
-                  frontier = expand_frontier(
+                  F = frontier(
                       G,
                       changed_nodes,
                       radius
                   )
 
                   positions = [
-                      i for i, n in enumerate(old_path)
-                      if n in frontier
+                      i for i, node in enumerate(old_path)
+                      if node in F
                   ]
 
                   if not positions:
                       continue
 
-                  li = max(0, min(positions) - 1)
-                  ri = min(
+                  left = max(
+                      0,
+                      min(positions) - 1
+                  )
+
+                  right = min(
                       len(old_path) - 1,
                       max(positions) + 1
                   )
 
-                  a = old_path[li]
-                  b = old_path[ri]
+                  a = old_path[left]
+                  b = old_path[right]
 
-                  local_nodes = set(frontier)
-                  local_nodes.update([a, b])
-
+                  local_nodes = F | {a, b}
                   H = G.subgraph(local_nodes)
 
                   try:
-                      local = nx.shortest_path(
+                      replacement = nx.shortest_path(
                           H,
                           a,
                           b,
@@ -199,191 +208,198 @@ jobs:
                       continue
 
                   candidate = (
-                      old_path[:li]
-                      + local
-                      + old_path[ri + 1:]
+                      old_path[:left]
+                      + replacement
+                      + old_path[right + 1:]
                   )
 
-                  cleaned = []
-
-                  for n in candidate:
-                      if not cleaned or cleaned[-1] != n:
-                          cleaned.append(n)
-
-                  try:
-                      c = cost(G, cleaned)
-                  except Exception:
+                  if not valid_path(G, candidate):
                       continue
+
+                  c = path_cost(G, candidate)
+                  ratio = c / optimal_cost
 
                   old_edges = set(
                       zip(old_path[:-1], old_path[1:])
                   )
 
                   new_edges = set(
-                      zip(cleaned[:-1], cleaned[1:])
+                      zip(candidate[:-1], candidate[1:])
                   )
 
                   disruption = len(
                       old_edges.symmetric_difference(new_edges)
                   )
 
-                  ratio = c / global_cost
-
-                  curve.append({
-                      "radius": radius,
-                      "frontier": len(frontier),
-                      "fraction": len(frontier) / len(G),
+                  result = {
+                      "success": ratio <= 1.0 + epsilon,
+                      "path": candidate,
                       "cost": c,
                       "quality_ratio": ratio,
-                      "disruption": disruption
-                  })
+                      "frontier": len(F),
+                      "radius": radius,
+                      "disruption": disruption,
+                      "time": time.perf_counter() - start
+                  }
 
-                  if ratio <= 1 + epsilon:
-                      return {
-                          "success": True,
-                          "path": cleaned,
-                          "cost": c,
-                          "quality_ratio": ratio,
-                          "frontier": len(frontier),
-                          "radius": radius,
-                          "disruption": disruption,
-                          "time": time.perf_counter() - start,
-                          "curve": curve
-                      }
+                  if best is None or ratio < best["quality_ratio"]:
+                      best = result
+
+                  if result["success"]:
+                      return result
+
+              if best:
+                  best["success"] = False
+                  return best
 
               return {
                   "success": False,
-                  "time": time.perf_counter() - start,
-                  "curve": curve
+                  "time": time.perf_counter() - start
               }
 
 
-          # ==========================================================
-          # E1: LARGE SCALE T3
-          # ==========================================================
+          # ============================================================
+          # E1 — SCALING
+          # ============================================================
 
-          print("\n=== E1 LARGE-SCALE T3 ===")
+          print("\n=== E1 T3 SCALING ===", flush=True)
 
-          graph_sizes = [
-              128,
-              256,
-              512,
-              1024,
-              2048,
-              4096
-          ]
+          scaling = []
 
-          for n in graph_sizes:
+          for n in [128, 256, 512, 1024, 2048, 4096]:
 
-              G = make_graph(n, SEED + n)
-
-              s, t = 0, n - 1
-
-              baseline = solve_global(G, s, t)
-
-              path = baseline["path"]
-
-              if len(path) < 2:
-                  continue
-
-              middle = (len(path) - 1) // 2
-              u, v = path[middle], path[middle + 1]
-
-              original = G[u][v]["weight"]
-
-              # Severe Terrain disturbance.
-              G[u][v]["weight"] *= 20
-
-              global_new = solve_global(G, s, t)
-
-              repair = adaptive_t3(
-                  G,
-                  path,
-                  {u, v},
-                  global_new["cost"]
+              G = make_graph(
+                  n,
+                  SEED + n
               )
 
-              if repair["success"]:
+              source = 0
+              target = n - 1
 
+              old_path, old_cost, _ = global_solution(
+                  G,
+                  source,
+                  target
+              )
+
+              if len(old_path) < 2:
+                  continue
+
+              i = (len(old_path) - 1) // 2
+              u, v = old_path[i], old_path[i + 1]
+
+              G[u][v]["weight"] *= 20.0
+
+              new_path, optimum, global_time = global_solution(
+                  G,
+                  source,
+                  target
+              )
+
+              repair = adaptive_repair(
+                  G,
+                  old_path,
+                  {u, v},
+                  optimum
+              )
+
+              reduction = None
+
+              if repair.get("frontier"):
                   reduction = (
-                      1 - repair["frontier"] / n
+                      1.0 -
+                      repair["frontier"] / n
                   )
 
-                  print(
-                      n,
-                      "quality=",
-                      repair["quality_ratio"],
-                      "frontier=",
-                      repair["frontier"],
-                      "reduction=",
+              result = {
+                  "nodes": n,
+                  "global_cost": optimum,
+                  "global_time": global_time,
+                  "repair_success":
+                      repair["success"],
+                  "t3_cost":
+                      repair.get("cost"),
+                  "quality_ratio":
+                      repair.get("quality_ratio"),
+                  "frontier":
+                      repair.get("frontier"),
+                  "radius":
+                      repair.get("radius"),
+                  "disruption":
+                      repair.get("disruption"),
+                  "t3_time":
+                      repair.get("time"),
+                  "recompute_reduction":
                       reduction
-                  )
+              }
 
-                  rows.append({
-                      "experiment": "scaling",
-                      "nodes": n,
-                      "global_cost": global_new["cost"],
-                      "t3_cost": repair["cost"],
-                      "quality_ratio":
-                          repair["quality_ratio"],
-                      "frontier":
-                          repair["frontier"],
-                      "recompute_reduction":
-                          reduction,
-                      "radius":
-                          repair["radius"],
-                      "disruption":
-                          repair["disruption"],
-                      "global_time":
-                          global_new["time"],
-                      "t3_time":
-                          repair["time"]
-                  })
+              scaling.append(result)
+
+              rows.append({
+                  "experiment": "scaling",
+                  **result
+              })
+
+              print(result, flush=True)
+
+          report["t3"]["scaling"] = scaling
 
 
-          # ==========================================================
-          # E2: 1000 DYNAMIC TERRAIN PERTURBATIONS
-          # ==========================================================
+          # ============================================================
+          # E2 — 250 REPEATED TERRAIN CHANGES
+          # ============================================================
 
-          print("\n=== E2 1000 PERTURBATIONS ===")
+          print(
+              "\n=== E2 250 TERRAIN PERTURBATIONS ===",
+              flush=True
+          )
 
-          G = make_graph(1024, SEED + 999)
+          G = make_graph(
+              1024,
+              SEED + 9000
+          )
 
+          trials = 250
           successes = 0
           ratios = []
           reductions = []
           disruptions = []
 
-          for trial in range(1000):
+          for trial in range(trials):
 
-              baseline = solve_global(
-                  G, 0, len(G) - 1
+              old_path, _, _ = global_solution(
+                  G,
+                  0,
+                  1023
               )
 
-              p = baseline["path"]
-
-              if len(p) < 2:
+              if len(old_path) < 2:
                   continue
 
-              i = random.randrange(len(p) - 1)
+              i = random.randrange(
+                  len(old_path) - 1
+              )
 
-              u, v = p[i], p[i + 1]
+              u, v = old_path[i], old_path[i + 1]
 
               original = G[u][v]["weight"]
 
               G[u][v]["weight"] *= random.uniform(
-                  1.25, 25
+                  1.25,
+                  20.0
               )
 
-              global_new = solve_global(
-                  G, 0, len(G) - 1
-              )
-
-              repair = adaptive_t3(
+              _, optimum, _ = global_solution(
                   G,
-                  p,
+                  0,
+                  1023
+              )
+
+              repair = adaptive_repair(
+                  G,
+                  old_path,
                   {u, v},
-                  global_new["cost"]
+                  optimum
               )
 
               if repair["success"]:
@@ -394,7 +410,8 @@ jobs:
                   )
 
                   reductions.append(
-                      1 - repair["frontier"] / len(G)
+                      1 -
+                      repair["frontier"] / len(G)
                   )
 
                   disruptions.append(
@@ -403,102 +420,161 @@ jobs:
 
               G[u][v]["weight"] = original
 
+              if (trial + 1) % 25 == 0:
+                  print(
+                      "completed",
+                      trial + 1,
+                      "/",
+                      trials,
+                      flush=True
+                  )
 
-          success_rate = successes / 1000
+          success_rate = successes / trials
 
-          mean_ratio = (
+          mean_quality = (
               statistics.mean(ratios)
-              if ratios else float("nan")
+              if ratios else None
           )
 
           mean_reduction = (
               statistics.mean(reductions)
-              if reductions else 0
+              if reductions else None
           )
 
-          print("success:", success_rate)
-          print("quality:", mean_ratio)
-          print("reduction:", mean_reduction)
-
-          rows.append({
-              "experiment": "1000_perturbations",
-              "nodes": 1024,
+          perturbation_summary = {
+              "trials": trials,
+              "successes": successes,
               "success_rate": success_rate,
-              "quality_ratio": mean_ratio,
-              "recompute_reduction":
+              "mean_quality_ratio": mean_quality,
+              "mean_recompute_reduction":
                   mean_reduction,
               "mean_disruption":
                   statistics.mean(disruptions)
                   if disruptions else None
-          })
+          }
 
-
-          # ==========================================================
-          # E3: TOPOLOGY FAILURE
-          # ==========================================================
-
-          print("\n=== E3 TOPOLOGY FAILURE ===")
-
-          G = make_graph(1024, SEED + 555)
-
-          baseline = solve_global(
-              G, 0, len(G) - 1
+          report["t3"]["perturbations"] = (
+              perturbation_summary
           )
 
-          p = baseline["path"]
+          rows.append({
+              "experiment":
+                  "terrain_perturbations",
+              **perturbation_summary
+          })
 
-          if len(p) > 2:
+          print(
+              perturbation_summary,
+              flush=True
+          )
 
-              i = (len(p) - 1) // 2
-              u, v = p[i], p[i + 1]
 
-              attr = dict(G[u][v])
+          # ============================================================
+          # E3 — TOPOLOGY FAILURE
+          # ============================================================
+
+          print(
+              "\n=== E3 TOPOLOGY FAILURE ===",
+              flush=True
+          )
+
+          G = make_graph(
+              1024,
+              SEED + 10000
+          )
+
+          old_path, _, _ = global_solution(
+              G,
+              0,
+              1023
+          )
+
+          topology_result = {
+              "attempted": False
+          }
+
+          if len(old_path) >= 2:
+
+              i = (len(old_path) - 1) // 2
+              u, v = old_path[i], old_path[i + 1]
+
+              attributes = dict(G[u][v])
 
               G.remove_edge(u, v)
 
-              full = solve_global(
-                  G, 0, len(G) - 1
-              )
+              try:
+                  _, optimum, global_time = global_solution(
+                      G,
+                      0,
+                      1023
+                  )
 
-              repair = adaptive_t3(
-                  G,
-                  p,
-                  {u, v},
-                  full["cost"]
-              )
+                  repair = adaptive_repair(
+                      G,
+                      old_path,
+                      {u, v},
+                      optimum
+                  )
 
-              rows.append({
-                  "experiment":
-                      "topology_failure",
-                  "nodes": 1024,
-                  "success":
-                      repair["success"],
-                  "global_cost":
-                      full["cost"],
-                  "t3_cost":
-                      repair.get("cost"),
-                  "quality_ratio":
-                      repair.get("quality_ratio"),
-                  "frontier":
-                      repair.get("frontier"),
-                  "radius":
-                      repair.get("radius"),
-                  "disruption":
-                      repair.get("disruption")
-              })
+                  topology_result = {
+                      "attempted": True,
+                      "repair_success":
+                          repair["success"],
+                      "global_cost":
+                          optimum,
+                      "global_time":
+                          global_time,
+                      "t3_cost":
+                          repair.get("cost"),
+                      "quality_ratio":
+                          repair.get("quality_ratio"),
+                      "frontier":
+                          repair.get("frontier"),
+                      "radius":
+                          repair.get("radius"),
+                      "disruption":
+                          repair.get("disruption")
+                  }
 
-              G.add_edge(u, v, **attr)
+              except Exception as exc:
+                  topology_result = {
+                      "attempted": True,
+                      "error": repr(exc)
+                  }
+
+              finally:
+                  G.add_edge(
+                      u,
+                      v,
+                      **attributes
+                  )
+
+          report["t3"]["topology_failure"] = (
+              topology_result
+          )
+
+          rows.append({
+              "experiment":
+                  "topology_failure",
+              **topology_result
+          })
+
+          print(
+              topology_result,
+              flush=True
+          )
 
 
-          # ==========================================================
-          # E4: QISKIT AER COMPUTE
-          # ==========================================================
+          # ============================================================
+          # E4 — QISKIT AER
+          # ============================================================
 
-          print("\n=== E4 AER ===")
+          print(
+              "\n=== E4 QISKIT AER ===",
+              flush=True
+          )
 
-          aer_rows = []
-
-          for qubits in [5, 8, 10, 12, 14]:
+          for qubits in [5, 10, 15, 20]:
 
               qc = QuantumCircuit(qubits)
 
@@ -509,327 +585,584 @@ jobs:
 
               qc.measure_all()
 
-              sim = AerSimulator()
+              simulator = AerSimulator()
 
               start = time.perf_counter()
 
-              result = sim.run(
+              result = simulator.run(
                   qc,
-                  shots=8192
+                  shots=4096
               ).result()
 
-              runtime = time.perf_counter() - start
+              elapsed = (
+                  time.perf_counter() - start
+              )
 
               counts = result.get_counts()
 
               good = (
-                  counts.get("0" * qubits, 0)
-                  + counts.get("1" * qubits, 0)
+                  counts.get(
+                      "0" * qubits,
+                      0
+                  )
+                  +
+                  counts.get(
+                      "1" * qubits,
+                      0
+                  )
               )
 
-              success = good / 8192
-
-              aer_rows.append({
+              aer_result = {
                   "qubits": qubits,
-                  "runtime": runtime,
-                  "ghz_success": success
-              })
+                  "shots": 4096,
+                  "runtime": elapsed,
+                  "ghz_success":
+                      good / 4096
+              }
+
+              report["aer"].append(
+                  aer_result
+              )
 
               print(
-                  qubits,
-                  runtime,
-                  success
+                  aer_result,
+                  flush=True
               )
 
-          raw["aer"] = aer_rows
+
+          # ============================================================
+          # SAVE CLASSICAL/AER RESULTS BEFORE IBM
+          # ============================================================
+
+          pd.DataFrame(rows).to_csv(
+              "t3_v6_results.csv",
+              index=False
+          )
+
+          with open(
+              "t3_v6_results.json",
+              "w"
+          ) as f:
+              json.dump(
+                  report,
+                  f,
+                  indent=2,
+                  default=str
+              )
 
 
-          # ==========================================================
-          # E5-E8 IBM QPU CAPABILITY
-          # ==========================================================
+          # ============================================================
+          # E5 — IBM BACKEND DISCOVERY
+          #
+          # IBM failure MUST NOT destroy T3 results.
+          # ============================================================
 
-          print("\n=== IBM QUANTUM ===")
+          print(
+              "\n=== E5 IBM QUANTUM ===",
+              flush=True
+          )
 
           token = os.getenv(
-              "IBM_QUANTUM_TOKEN", ""
+              "IBM_QUANTUM_TOKEN",
+              ""
           ).strip()
 
           instance = os.getenv(
-              "IBM_QUANTUM_INSTANCE", ""
+              "IBM_QUANTUM_INSTANCE",
+              ""
           ).strip()
 
-          ibm = {}
-
-          if token:
-
-              kwargs = {
-                  "channel":
-                      "ibm_quantum_platform",
-                  "token":
-                      token
-              }
-
-              if instance:
-                  kwargs["instance"] = instance
-
-              service = QiskitRuntimeService(**kwargs)
-
-              backends = service.backends(
-                  operational=True,
-                  simulator=False
-              )
-
-              ibm["available_backends"] = [
-                  {
-                      "name": b.name,
-                      "qubits": b.num_qubits
-                  }
-                  for b in backends
-              ]
-
-              backend = service.least_busy(
-                  operational=True,
-                  simulator=False,
-                  min_num_qubits=10
-              )
-
-              print(
-                  "backend:",
-                  backend.name,
-                  backend.num_qubits
-              )
-
-              ibm["selected_backend"] = backend.name
-              ibm["selected_qubits"] = backend.num_qubits
-
-
-              # ------------------------------------------------------
-              # Hardware workload
-              # ------------------------------------------------------
-
-              nq = 10
-
-              qc = QuantumCircuit(nq)
-
-              qc.h(0)
-
-              for q in range(nq - 1):
-                  qc.cx(q, q + 1)
-
-              qc.measure_all()
-
-              pm = generate_preset_pass_manager(
-                  backend=backend,
-                  optimization_level=3
-              )
-
-              isa = pm.run(qc)
-
-              sampler = SamplerV2(
-                  mode=backend
-              )
-
-              sampler.options.dynamical_decoupling.enable = True
-              sampler.options.dynamical_decoupling.sequence_type = "XpXm"
-
-              sampler.options.twirling.enable_gates = True
-              sampler.options.twirling.num_randomizations = 64
-              sampler.options.twirling.shots_per_randomization = 128
-
-              print("Submitting SamplerV2")
-
-              sjob = sampler.run(
-                  [isa],
-                  shots=8192
-              )
-
-              print(
-                  "Sampler job:",
-                  sjob.job_id()
-              )
-
-              sr = sjob.result()[0]
-
-              counts = sr.data.meas.get_counts()
-
-              good = (
-                  counts.get("0" * nq, 0)
-                  + counts.get("1" * nq, 0)
-              )
-
-              ibm["sampler_job"] = sjob.job_id()
-              ibm["ghz_success"] = good / 8192
-
-
-              # ------------------------------------------------------
-              # Estimator baseline vs resilience level 2
-              # ------------------------------------------------------
-
-              qce = QuantumCircuit(nq)
-
-              qce.h(0)
-
-              for q in range(nq - 1):
-                  qce.cx(q, q + 1)
-
-              isa_est = pm.run(qce)
-
-              obs = SparsePauliOp(
-                  "Z" * nq
-              ).apply_layout(
-                  isa_est.layout
-              )
-
-
-              # Level 0
-              est0 = EstimatorV2(
-                  mode=backend
-              )
-
-              est0.options.resilience_level = 0
-              est0.options.default_precision = 0.02
-
-              job0 = est0.run([
-                  (isa_est, obs)
-              ])
-
-              r0 = job0.result()[0]
-
-              ibm["estimator_level0_job"] = (
-                  job0.job_id()
-              )
-
-              ibm["level0_ev"] = (
-                  np.asarray(
-                      r0.data.evs
-                  ).tolist()
-              )
-
-
-              # Level 2 + ZNE + DD + twirling
-              est2 = EstimatorV2(
-                  mode=backend
-              )
-
-              est2.options.resilience_level = 2
-
-              est2.options.dynamical_decoupling.enable = True
-              est2.options.dynamical_decoupling.sequence_type = "XpXm"
-
-              est2.options.twirling.enable_gates = True
-
-              est2.options.resilience.zne_mitigation = True
-
-              est2.options.resilience.zne.noise_factors = (
-                  1, 3, 5
-              )
-
-              est2.options.resilience.zne.extrapolator = (
-                  "exponential",
-                  "linear"
-              )
-
-              print(
-                  "Submitting resilience-level-2 Estimator"
-              )
-
-              job2 = est2.run(
-                  [(isa_est, obs)],
-                  precision=0.02
-              )
-
-              r2 = job2.result()[0]
-
-              ibm["estimator_level2_job"] = (
-                  job2.job_id()
-              )
-
-              ibm["level2_ev"] = (
-                  np.asarray(
-                      r2.data.evs
-                  ).tolist()
-              )
-
-              ibm["level2_std"] = (
-                  np.asarray(
-                      r2.data.stds
-                  ).tolist()
-              )
-
-
-              # ------------------------------------------------------
-              # OPTIONAL BOUNDED PEC
-              # ------------------------------------------------------
-
-              if ENABLE_PEC:
-
-                  print(
-                      "Submitting bounded PEC experiment"
-                  )
-
-                  pec = EstimatorV2(
-                      mode=backend
-                  )
-
-                  pec.options.resilience_level = 1
-
-                  pec.options.resilience.pec_mitigation = True
-
-                  # Deliberate cost guard.
-                  pec.options.resilience.pec.max_overhead = 10
-
-                  pec.options.twirling.enable_gates = True
-
-                  pjob = pec.run(
-                      [(isa_est, obs)],
-                      precision=0.05
-                  )
-
-                  pr = pjob.result()[0]
-
-                  ibm["pec_job"] = pjob.job_id()
-
-                  ibm["pec_ev"] = (
-                      np.asarray(
-                          pr.data.evs
-                      ).tolist()
-                  )
-
-          else:
-              print(
-                  "IBM token unavailable; QPU tests skipped."
-              )
-
-          raw["ibm"] = ibm
-
-
-          # ==========================================================
-          # E9 QISKIT CAPABILITY SCORE
-          # ==========================================================
-
-          qiskit_score = {
-              "aer_scaling_completed":
-                  len(aer_rows) == 5,
-              "ibm_connected":
-                  bool(ibm.get("selected_backend")),
-              "sampler_v2_completed":
-                  bool(ibm.get("sampler_job")),
-              "estimator_raw_completed":
-                  bool(ibm.get("estimator_level0_job")),
-              "estimator_resilient_completed":
-                  bool(ibm.get("estimator_level2_job")),
-              "pec_completed":
-                  bool(ibm.get("pec_job"))
+          ibm = {
+              "token_present": bool(token),
+              "qpu_attempted": False,
+              "qpu_completed": False
           }
 
-          qiskit_score["score"] = sum(
-              bool(v)
-              for k, v in qiskit_score.items()
-              if k != "score"
+          if not token:
+
+              ibm["status"] = (
+                  "No IBM token available; "
+                  "hardware test skipped."
+              )
+
+              print(
+                  ibm["status"],
+                  flush=True
+              )
+
+          else:
+
+              try:
+                  from qiskit_ibm_runtime import (
+                      QiskitRuntimeService,
+                      SamplerV2
+                  )
+
+                  kwargs = {
+                      "channel":
+                          "ibm_quantum_platform",
+                      "token":
+                          token
+                  }
+
+                  if instance:
+                      kwargs["instance"] = instance
+
+                  service = QiskitRuntimeService(
+                      **kwargs
+                  )
+
+                  # IMPORTANT:
+                  # Do not use least_busy(min_num_qubits=...).
+                  # First inspect what THIS account can access.
+
+                  available = service.backends()
+
+                  backend_info = []
+
+                  for backend in available:
+
+                      try:
+                          operational = (
+                              backend.status().operational
+                          )
+                      except Exception:
+                          operational = None
+
+                      backend_info.append({
+                          "name":
+                              backend.name,
+                          "qubits":
+                              getattr(
+                                  backend,
+                                  "num_qubits",
+                                  None
+                              ),
+                          "operational":
+                              operational
+                      })
+
+                  ibm["available_backends"] = (
+                      backend_info
+                  )
+
+                  print(
+                      "Accessible backends:",
+                      backend_info,
+                      flush=True
+                  )
+
+                  candidates = []
+
+                  for backend in available:
+
+                      try:
+                          if (
+                              backend.status().operational
+                              and
+                              not getattr(
+                                  backend.configuration(),
+                                  "simulator",
+                                  False
+                              )
+                          ):
+                              candidates.append(
+                                  backend
+                              )
+
+                      except Exception:
+                          # Modern backend may not expose
+                          # configuration in exactly the same way.
+                          try:
+                              if backend.status().operational:
+                                  candidates.append(
+                                      backend
+                                  )
+                          except Exception:
+                              pass
+
+                  if not candidates:
+
+                      ibm["status"] = (
+                          "Authentication succeeded, "
+                          "but no operational QPU "
+                          "is currently accessible."
+                      )
+
+                      print(
+                          ibm["status"],
+                          flush=True
+                      )
+
+                  else:
+
+                      # Prefer shortest queue if status
+                      # exposes pending_jobs.
+
+                      def queue_key(backend):
+                          try:
+                              return (
+                                  backend.status().pending_jobs
+                              )
+                          except Exception:
+                              return 10**9
+
+                      candidates.sort(
+                          key=queue_key
+                      )
+
+                      backend = candidates[0]
+
+                      ibm["selected_backend"] = (
+                          backend.name
+                      )
+
+                      ibm["selected_qubits"] = (
+                          getattr(
+                              backend,
+                              "num_qubits",
+                              None
+                          )
+                      )
+
+                      ibm["pending_jobs"] = (
+                          queue_key(backend)
+                      )
+
+                      print(
+                          "Selected:",
+                          backend.name,
+                          "qubits:",
+                          ibm["selected_qubits"],
+                          "pending:",
+                          ibm["pending_jobs"],
+                          flush=True
+                      )
+
+                      # Small control workload deliberately used
+                      # so queue/runtime does not dominate V6.
+
+                      nq = min(
+                          5,
+                          int(
+                              ibm["selected_qubits"]
+                              or 5
+                          )
+                      )
+
+                      qc = QuantumCircuit(nq)
+
+                      qc.h(0)
+
+                      for q in range(nq - 1):
+                          qc.cx(q, q + 1)
+
+                      qc.measure_all()
+
+                      pm = (
+                          generate_preset_pass_manager(
+                              backend=backend,
+                              optimization_level=3
+                          )
+                      )
+
+                      isa = pm.run(qc)
+
+                      sampler = SamplerV2(
+                          mode=backend
+                      )
+
+                      ibm["qpu_attempted"] = True
+
+                      job = sampler.run(
+                          [isa],
+                          shots=256
+                      )
+
+                      ibm["job_id"] = (
+                          job.job_id()
+                      )
+
+                      print(
+                          "IBM job submitted:",
+                          ibm["job_id"],
+                          flush=True
+                      )
+
+                      # Poll explicitly so V6 does not wait
+                      # indefinitely for IBM queue.
+
+                      deadline = (
+                          time.time() + 600
+                      )
+
+                      terminal = {
+                          "DONE",
+                          "ERROR",
+                          "CANCELLED"
+                      }
+
+                      while time.time() < deadline:
+
+                          status = job.status()
+
+                          status_name = (
+                              getattr(
+                                  status,
+                                  "name",
+                                  str(status)
+                              )
+                          )
+
+                          print(
+                              "IBM job status:",
+                              status_name,
+                              flush=True
+                          )
+
+                          if status_name in terminal:
+                              break
+
+                          time.sleep(20)
+
+                      status = job.status()
+
+                      status_name = (
+                          getattr(
+                              status,
+                              "name",
+                              str(status)
+                          )
+                      )
+
+                      ibm["final_status"] = (
+                          status_name
+                      )
+
+                      if status_name == "DONE":
+
+                          qresult = (
+                              job.result()[0]
+                          )
+
+                          counts = (
+                              qresult
+                              .data
+                              .meas
+                              .get_counts()
+                          )
+
+                          good = (
+                              counts.get(
+                                  "0" * nq,
+                                  0
+                              )
+                              +
+                              counts.get(
+                                  "1" * nq,
+                                  0
+                              )
+                          )
+
+                          total = sum(
+                              counts.values()
+                          )
+
+                          ibm["counts"] = counts
+                          ibm["ghz_success"] = (
+                              good / total
+                              if total else None
+                          )
+
+                          ibm["qpu_completed"] = True
+
+                          print(
+                              "QPU GHZ success:",
+                              ibm["ghz_success"],
+                              flush=True
+                          )
+
+                      else:
+
+                          ibm["status"] = (
+                              "QPU job did not complete "
+                              "inside V6's 10-minute "
+                              "queue guard. Job ID was "
+                              "preserved."
+                          )
+
+                          print(
+                              ibm["status"],
+                              flush=True
+                          )
+
+              except Exception as exc:
+
+                  ibm["status"] = (
+                      "IBM section failed gracefully."
+                  )
+
+                  ibm["error"] = repr(exc)
+
+                  print(
+                      "IBM warning:",
+                      repr(exc),
+                      flush=True
+                  )
+
+
+          # ============================================================
+          # FINAL VERDICT
+          # ============================================================
+
+          report["ibm"] = ibm
+
+          t3_supported = (
+              success_rate >= 0.90
+              and
+              mean_quality is not None
+              and
+              mean_quality <= 1.02
+              and
+              mean_reduction is not None
+              and
+              mean_reduction >= 0.50
           )
 
-          raw["qiskit_capability"] = qiskit_score
+          report["t3"]["verdict"] = {
+              "supported":
+                  t3_supported,
+              "success_rate":
+                  success_rate,
+              "mean_quality_ratio":
+                  mean_quality,
+              "mean_recompute_reduction":
+                  mean_reduction,
+              "criteria": {
+                  "success_rate":
+                      ">= 0.90",
+                  "quality_ratio":
+                      "<= 1.02",
+                  "recompute_reduction":
+                      ">= 0.50"
+              }
+          }
 
+          report["qiskit_capability"] = {
+              "aer_completed":
+                  len(report["aer"]) == 4,
+              "ibm_authenticated":
+                  bool(
+                      ibm.get(
+                          "available_backends"
+                      )
+                  ),
+              "qpu_attempted":
+                  ibm.get(
+                      "qpu_attempted",
+                      False
+                  ),
+              "qpu_completed":
+                  ibm.get(
+                      "qpu_completed",
+                      False
+                  )
+          }
 
-          # ==========================================================
-          # E10 T3 BEN
+          with open(
+              "t3_v6_results.json",
+              "w"
+          ) as f:
+              json.dump(
+                  report,
+                  f,
+                  indent=2,
+                  default=str
+              )
+
+          print(
+              "\n=== V6 FINAL ===",
+              flush=True
+          )
+
+          print(
+              "T3 hypothesis supported:",
+              t3_supported,
+              flush=True
+          )
+
+          print(
+              "IBM:",
+              ibm.get(
+                  "status",
+                  "completed"
+              ),
+              flush=True
+          )
+
+          print(
+              "V6_COMPLETE",
+              flush=True
+          )
+
+          PY
+
+          python -u /tmp/v6.py
+
+          test -s t3_v6_results.json
+          test -s t3_v6_results.csv
+
+          grep -q '"verdict"' t3_v6_results.json
+
+          echo "V6 benchmark outputs validated."
+
+      - name: Show V6 summary
+        if: always()
+        run: |
+          echo "=== Files ==="
+          ls -lh t3_v6_results.* 2>/dev/null || true
+
+          echo "=== JSON summary ==="
+          if [ -f t3_v6_results.json ]; then
+            python - <<'PY'
+          import json
+
+          with open("t3_v6_results.json") as f:
+              r = json.load(f)
+
+          print("T3 verdict:")
+          print(
+              json.dumps(
+                  r.get("t3", {}).get("verdict", {}),
+                  indent=2
+              )
+          )
+
+          print("Qiskit capability:")
+          print(
+              json.dumps(
+                  r.get("qiskit_capability", {}),
+                  indent=2
+              )
+          )
+
+          print("IBM:")
+          print(
+              json.dumps(
+                  r.get("ibm", {}),
+                  indent=2
+              )
+          )
+          PY
+          fi
+
+      - name: Upload V6 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-v6-results
+          path: |
+            t3_v6_results.csv
+            t3_v6_results.json
+          if-no-files-found: warn
+          retention-days: 30
